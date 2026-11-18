@@ -31,7 +31,7 @@ loop i 1 9
 query I
 PRAGMA tpcds({i})
 ----
-<FILE>:duckdb/extension/tpcds/dsdgen/answers/sf1/0{i}.csv
+<FILE>:{WORKING_DIRECTORY}/../duckdb/extension/tpcds/dsdgen/answers/sf1/0{i}.csv
 
 endloop
 
@@ -40,6 +40,6 @@ loop i 10 100
 query I
 PRAGMA tpcds({i})
 ----
-<FILE>:duckdb/extension/tpcds/dsdgen/answers/sf1/{i}.csv
+<FILE>:{WORKING_DIRECTORY}/../duckdb/extension/tpcds/dsdgen/answers/sf1/{i}.csv
 
 endloop
