@@ -150,6 +150,7 @@ void ArrowFileScan::InitializeScanData(ArrowFileLocalState& lstate,
       ArrowSchemaDeepCopy(&schema_root.arrow_schema,
                           &lstate.local_arrow_function_data->schema_root.arrow_schema));
   lstate.local_arrow_function_data->arrow_table = arrow_table;
+  lstate.local_arrow_function_data->evaluate_filters = true;
   // Global column indexes and projection ids do not address this file's schema
   auto local_column_indexes = column_indexes;
   if (local_column_indexes.empty()) {
@@ -160,6 +161,10 @@ void ArrowFileScan::InitializeScanData(ArrowFileLocalState& lstate,
   lstate.init_input = make_uniq<TableFunctionInitInput>(*lstate.local_arrow_function_data,
                                                         std::move(local_column_indexes),
                                                         no_projection_ids, filters);
+  if (!expression_map.empty()) {
+    lstate.file_input.expression_map = expression_map;
+    lstate.init_input->multi_file_input = lstate.file_input;
+  }
 }
 
 void ArrowFileScan::StartScan(ClientContext& context, ArrowFileLocalState& lstate) {

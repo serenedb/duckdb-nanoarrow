@@ -44,8 +44,8 @@ struct ReadArrowStream : ArrowTableFunction {
   static TableFunction Function() {
     MultiFileFunction<ArrowMultiFileInfo> read_arrow("read_arrow");
     read_arrow.projection_pushdown = true;
-    read_arrow.filter_pushdown = false;
-    read_arrow.filter_prune = false;
+    read_arrow.filter_pushdown = true;
+    read_arrow.filter_prune = true;
     return static_cast<TableFunction>(read_arrow);
   }
 

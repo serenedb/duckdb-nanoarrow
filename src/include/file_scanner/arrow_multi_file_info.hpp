@@ -9,6 +9,7 @@
 #pragma once
 
 #include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/common/multi_file/table_function_multi_file.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "ipc/stream_reader/ipc_file_stream_reader.hpp"
 
@@ -45,6 +46,7 @@ struct ArrowFileLocalState : public LocalTableFunctionState {
   //! Each local state refers to an Arrow Scan on a local file
   unique_ptr<ArrowScanFunctionData> local_arrow_function_data;
   unique_ptr<TableFunctionInitInput> init_input;
+  TableFunctionFileInitInput file_input;
   unique_ptr<GlobalTableFunctionState> local_arrow_global_state;
   unique_ptr<LocalTableFunctionState> local_arrow_local_state;
   unique_ptr<TableFunctionInput> table_function_input;

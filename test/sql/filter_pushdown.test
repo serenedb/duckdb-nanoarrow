@@ -1,0 +1,273 @@
+# name: test/sql/filter_pushdown.test
+# description: Filters pushed into read_arrow return what the same filters return above the scan
+# group: [sql]
+
+require nanoarrow
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE src AS SELECT
+    i AS id,
+    i % 7 AS grp,
+    md5(i::VARCHAR) AS name,
+    repeat(md5(i::VARCHAR), 4) AS payload,
+    DATE '2024-01-01' + (i // 100)::INTEGER AS day,
+    TIMESTAMP '2024-01-01' + to_seconds(i) AS ts,
+    (i * 0.01)::DECIMAL(18, 2) AS price,
+    (i * 0.0001)::DECIMAL(38, 4) AS big,
+    CASE WHEN i % 10 = 0 THEN i END AS sparse,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE 'v' || (i % 50)::VARCHAR END AS tag,
+    {'a': i, 'b': 'w' || i::VARCHAR} AS s,
+    [i, i + 1] AS l
+FROM range(40000) t(i);
+
+statement ok
+COPY src TO '{DATA_PATH}/pushdown.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 5000);
+
+statement ok
+COPY src TO '{DATA_PATH}/pushdown.arrows' (FORMAT ARROWS, ROW_GROUP_SIZE 5000);
+
+statement ok
+CREATE TABLE expected AS FROM read_arrow('{DATA_PATH}/pushdown.arrow');
+
+query II
+EXPLAIN SELECT id FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 3
+----
+physical_plan	<REGEX>:.*READ_ARROW.*Column Filter: grp = 3.*
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 3 AND id > 1000
+----
+5571
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 3 AND id > 1000 EXCEPT ALL SELECT * FROM expected WHERE grp = 3 AND id > 1000)
+	UNION ALL
+	(SELECT * FROM expected WHERE grp = 3 AND id > 1000 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 3 AND id > 1000)
+)
+----
+0
+
+query III
+SELECT count(*), min(id), max(id) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE id BETWEEN 37000 AND 37010
+----
+11	37000	37010
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE id BETWEEN 37000 AND 37010 EXCEPT ALL SELECT * FROM expected WHERE id BETWEEN 37000 AND 37010)
+	UNION ALL
+	(SELECT * FROM expected WHERE id BETWEEN 37000 AND 37010 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE id BETWEEN 37000 AND 37010)
+)
+----
+0
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE id > 100000
+----
+0
+
+query IIII
+SELECT id, payload = repeat(name, 4), s, l FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE name = md5('12345')
+----
+12345	true	{'a': 12345, 'b': w12345}	[12345, 12346]
+
+query I
+SELECT (SELECT count(*) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE name >= 'fe') = (SELECT count(*) FROM src WHERE name >= 'fe')
+----
+true
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE name >= 'fe' EXCEPT ALL SELECT * FROM expected WHERE name >= 'fe')
+	UNION ALL
+	(SELECT * FROM expected WHERE name >= 'fe' EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE name >= 'fe')
+)
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT id % 3) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag = 'v7'
+----
+533	2
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag = 'v7' EXCEPT ALL SELECT * FROM expected WHERE tag = 'v7')
+	UNION ALL
+	(SELECT * FROM expected WHERE tag = 'v7' EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag = 'v7')
+)
+----
+0
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag IS NULL
+----
+13334
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag IS NULL EXCEPT ALL SELECT * FROM expected WHERE tag IS NULL)
+	UNION ALL
+	(SELECT * FROM expected WHERE tag IS NULL EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE tag IS NULL)
+)
+----
+0
+
+query III
+SELECT count(*), min(id), max(id) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE day BETWEEN DATE '2024-02-01' AND DATE '2024-02-03'
+----
+300	3100	3399
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE day BETWEEN DATE '2024-02-01' AND DATE '2024-02-03' EXCEPT ALL SELECT * FROM expected WHERE day BETWEEN DATE '2024-02-01' AND DATE '2024-02-03')
+	UNION ALL
+	(SELECT * FROM expected WHERE day BETWEEN DATE '2024-02-01' AND DATE '2024-02-03' EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE day BETWEEN DATE '2024-02-01' AND DATE '2024-02-03')
+)
+----
+0
+
+query III
+SELECT count(*), min(id), max(id) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE ts >= TIMESTAMP '2024-01-01 10:59:00' AND ts < TIMESTAMP '2024-01-01 11:00:00'
+----
+60	39540	39599
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE ts >= TIMESTAMP '2024-01-01 10:59:00' AND ts < TIMESTAMP '2024-01-01 11:00:00' EXCEPT ALL SELECT * FROM expected WHERE ts >= TIMESTAMP '2024-01-01 10:59:00' AND ts < TIMESTAMP '2024-01-01 11:00:00')
+	UNION ALL
+	(SELECT * FROM expected WHERE ts >= TIMESTAMP '2024-01-01 10:59:00' AND ts < TIMESTAMP '2024-01-01 11:00:00' EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE ts >= TIMESTAMP '2024-01-01 10:59:00' AND ts < TIMESTAMP '2024-01-01 11:00:00')
+)
+----
+0
+
+query III
+SELECT count(*), min(price), max(price) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE price BETWEEN 100.00 AND 101.50
+----
+151	100.00	101.50
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE price BETWEEN 100.00 AND 101.50 EXCEPT ALL SELECT * FROM expected WHERE price BETWEEN 100.00 AND 101.50)
+	UNION ALL
+	(SELECT * FROM expected WHERE price BETWEEN 100.00 AND 101.50 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE price BETWEEN 100.00 AND 101.50)
+)
+----
+0
+
+query II
+SELECT count(*), max(big) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE big < 0.0100
+----
+100	0.0099
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE big < 0.0100 EXCEPT ALL SELECT * FROM expected WHERE big < 0.0100)
+	UNION ALL
+	(SELECT * FROM expected WHERE big < 0.0100 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE big < 0.0100)
+)
+----
+0
+
+query III
+SELECT count(*), min(sparse), max(sparse) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse > 39000
+----
+99	39010	39990
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse > 39000 EXCEPT ALL SELECT * FROM expected WHERE sparse > 39000)
+	UNION ALL
+	(SELECT * FROM expected WHERE sparse > 39000 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse > 39000)
+)
+----
+0
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse IS NULL
+----
+36000
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse IS NULL AND grp = 1 EXCEPT ALL SELECT * FROM expected WHERE sparse IS NULL AND grp = 1)
+	UNION ALL
+	(SELECT * FROM expected WHERE sparse IS NULL AND grp = 1 EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE sparse IS NULL AND grp = 1)
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+	(SELECT name, tag, s FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 5 AND price < 50.00 EXCEPT ALL SELECT name, tag, s FROM expected WHERE grp = 5 AND price < 50.00)
+	UNION ALL
+	(SELECT name, tag, s FROM expected WHERE grp = 5 AND price < 50.00 EXCEPT ALL SELECT name, tag, s FROM read_arrow('{DATA_PATH}/pushdown.arrow') WHERE grp = 5 AND price < 50.00)
+)
+----
+0
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrows') WHERE grp = 3 AND tag IS NOT NULL EXCEPT ALL SELECT * FROM expected WHERE grp = 3 AND tag IS NOT NULL)
+	UNION ALL
+	(SELECT * FROM expected WHERE grp = 3 AND tag IS NOT NULL EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/pushdown.arrows') WHERE grp = 3 AND tag IS NOT NULL)
+)
+----
+0
+
+query III
+SELECT count(*), min(id), max(id) FROM read_arrow('{DATA_PATH}/pushdown.arrows') WHERE id BETWEEN 37000 AND 37010
+----
+11	37000	37010
+
+statement ok
+CREATE TABLE dict AS FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow');
+
+query I
+SELECT count(*) FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') WHERE d = 'beta'
+----
+28000
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') WHERE d = 'beta' AND v > 70000 EXCEPT ALL SELECT * FROM dict WHERE d = 'beta' AND v > 70000)
+	UNION ALL
+	(SELECT * FROM dict WHERE d = 'beta' AND v > 70000 EXCEPT ALL SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') WHERE d = 'beta' AND v > 70000)
+)
+----
+0
+
+statement ok
+COPY (SELECT i AS k, i::INTEGER AS v FROM range(5000) t(i)) TO '{DATA_PATH}/union_int.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 2048);
+
+statement ok
+COPY (SELECT i AS k, CASE WHEN i % 2 = 0 THEN i::VARCHAR ELSE 'x' || i::VARCHAR END AS v FROM range(5000) t(i)) TO '{DATA_PATH}/union_str.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 2048);
+
+statement ok
+CREATE TABLE union_expected AS FROM read_arrow(['{DATA_PATH}/union_int.arrow', '{DATA_PATH}/union_str.arrow'], union_by_name = true);
+
+query II
+SELECT k, v FROM read_arrow(['{DATA_PATH}/union_int.arrow', '{DATA_PATH}/union_str.arrow'], union_by_name = true) WHERE v IN ('7', 'x7', '8') ORDER BY k, v
+----
+7	7
+7	x7
+8	8
+8	8
+
+query I
+SELECT count(*) FROM (
+	(SELECT * FROM read_arrow(['{DATA_PATH}/union_int.arrow', '{DATA_PATH}/union_str.arrow'], union_by_name = true) WHERE v = 'x9' OR v = '9' EXCEPT ALL SELECT * FROM union_expected WHERE v = 'x9' OR v = '9')
+	UNION ALL
+	(SELECT * FROM union_expected WHERE v = 'x9' OR v = '9' EXCEPT ALL SELECT * FROM read_arrow(['{DATA_PATH}/union_int.arrow', '{DATA_PATH}/union_str.arrow'], union_by_name = true) WHERE v = 'x9' OR v = '9')
+)
+----
+0
