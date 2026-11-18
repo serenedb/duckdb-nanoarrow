@@ -279,6 +279,7 @@ void ArrowWriteFlushBatch(ClientContext& context, FunctionData& bind_data,
 
 void RegisterArrowStreamCopyFunction(ExtensionLoader& loader) {
   CopyFunction function("arrows");
+  function.writes_typed_columns = true;
   function.copy_to_bind = ArrowWriteBind;
   function.copy_to_initialize_global = ArrowWriteInitializeGlobal;
   function.copy_to_initialize_local = ArrowWriteInitializeLocal;
