@@ -34,7 +34,7 @@ query II
 SELECT column_name, column_type FROM (DESCRIBE FROM check_arrow_testing_file('1.0.0-littleendian/generated_duplicate_fieldnames'));
 ----
 ints	TINYINT
-ints_1	INTEGER
+ints:1	INTEGER
 struct	STRUCT(v0 INTEGER, v1 VARCHAR)
 
 statement ok

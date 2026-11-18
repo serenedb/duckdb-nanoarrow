@@ -16,7 +16,7 @@ SELECT * FROM '{DATA_PATH}/dup.arrows';
 1	10
 
 query I
-SELECT a_1 FROM '{DATA_PATH}/dup.arrows';
+SELECT "a:1" FROM '{DATA_PATH}/dup.arrows';
 ----
 10
 
@@ -33,14 +33,14 @@ SELECT * FROM '{DATA_PATH}/case.arrows';
 query I
 SELECT s FROM read_arrow('data/struct_duplicate_children.arrow');
 ----
-{'x': 1, 'x_1': a}
+{'x': 1, 'x:1': a}
 
 query I
 SELECT s FROM read_arrow('data/struct_case_children.arrow');
 ----
-{'id': 1, 'ID_1': 100}
+{'id': 1, 'ID:1': 100}
 
 query I
-SELECT s.x_1 FROM read_arrow('data/struct_duplicate_children.arrow');
+SELECT s."x:1" FROM read_arrow('data/struct_duplicate_children.arrow');
 ----
 a
