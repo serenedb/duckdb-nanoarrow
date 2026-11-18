@@ -44,12 +44,14 @@ struct ArrowMultiFileData final : public TableFunctionData {
   unique_ptr<FunctionData> Copy() const override {
     auto result = make_uniq<ArrowMultiFileData>();
     result->initial_file_claims = initial_file_claims;
+    result->initial_file_footer = initial_file_footer;
     return std::move(result);
   }
 
   unique_ptr<ArrowFileScan> file_scan;
   //! How many scans the first file allows, which bounds the threads of a one file scan
   idx_t initial_file_claims = 1;
+  bool initial_file_footer = false;
 };
 
 unique_ptr<TableFunctionData> ArrowMultiFileInfo::InitializeBindData(
@@ -79,12 +81,25 @@ void ArrowMultiFileInfo::BindReader(ClientContext& context,
 void ArrowMultiFileInfo::FinalizeBindData(MultiFileBindData& multi_file_data) {
   if (multi_file_data.initial_reader) {
     auto& bind_data = multi_file_data.bind_data->Cast<ArrowMultiFileData>();
-    bind_data.initial_file_claims =
-        multi_file_data.initial_reader->Cast<ArrowFileScan>().ClaimCount();
+    auto& file_scan = multi_file_data.initial_reader->Cast<ArrowFileScan>();
+    bind_data.initial_file_claims = file_scan.ClaimCount();
+    bind_data.initial_file_footer = file_scan.HasFooter();
   }
 }
 
 void ArrowMultiFileInfo::GetBindInfo(const TableFunctionData& bind_data, BindInfo& info) {
+}
+
+bool ArrowMultiFileInfo::SupportsLookup(const MultiFileBindData& bind_data,
+                                        TableFunctionLookupInfo& info) const {
+  return bind_data.bind_data->Cast<ArrowMultiFileData>().initial_file_footer;
+}
+
+void ArrowMultiFileInfo::GetVirtualColumns(ClientContext& context,
+                                           MultiFileBindData& bind_data,
+                                           virtual_column_map_t& result) {
+  result.insert(make_pair(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER,
+                          TableColumn("file_row_number", LogicalType::BIGINT)));
 }
 
 optional_idx ArrowMultiFileInfo::MaxThreads(const MultiFileBindData& bind_data_p,

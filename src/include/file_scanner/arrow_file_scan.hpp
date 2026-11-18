@@ -45,6 +45,10 @@ class ArrowFileScan : public BaseFileReader {
                          LocalTableFunctionState& lstate) override;
   AsyncResult Scan(ClientContext& context, GlobalTableFunctionState& global_state,
                    LocalTableFunctionState& local_state, DataChunk& chunk) override;
+  void Lookup(ClientContext& context, GlobalTableFunctionState& global_state,
+              LocalTableFunctionState& local_state, std::span<const int64_t> rows,
+              std::span<idx_t> survivors, DataChunk& chunk) override;
+  void AddVirtualColumn(column_t virtual_column_id) override;
   double GetProgressInFile(ClientContext& context) override;
 
   shared_ptr<BaseUnionData> GetUnionData(idx_t file_idx) override;
@@ -53,6 +57,7 @@ class ArrowFileScan : public BaseFileReader {
   idx_t EstimatedRowCount();
   //! How many scans can run on this file at once
   idx_t ClaimCount() const;
+  bool HasFooter() const;
 
  private:
   //! A range of footer blocks that one scan reads
@@ -65,8 +70,15 @@ class ArrowFileScan : public BaseFileReader {
   void PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks, idx_t min_claim_bytes);
   void InitializeScanData(ArrowFileLocalState& lstate,
                           shared_ptr<ArrowScanFactory> producer);
+  void OpenBlockReader(ArrowFileLocalState& lstate, bool read_columns);
   void StartScan(ClientContext& context, ArrowFileLocalState& lstate);
   static void FinishClaim(ArrowFileLocalState& lstate);
+  const vector<idx_t>& BatchStarts();
+  void PrepareLookup(ClientContext& context, ArrowFileLocalState& lstate,
+                     const DataChunk& chunk);
+  idx_t LookupBatch(ArrowFileLocalState& lstate, shared_ptr<ArrowArrayWrapper> batch,
+                    idx_t batch_start, std::span<const int64_t> rows, idx_t begin,
+                    idx_t end, std::span<idx_t> survivors, DataChunk& chunk, idx_t found);
   //! Produces the stream of the blocks a local state claimed, from its block reader
   class BlockScanFactory;
 
@@ -84,6 +96,9 @@ class ArrowFileScan : public BaseFileReader {
   vector<BlockRange> claims;
   //! Whether a scan that reads no file column can count rows from the headers
   bool count_without_bodies = false;
+  optional_idx file_row_number;
+  vector<idx_t> batch_starts;
+  mutex batch_starts_lock;
   idx_t file_size = 0;
   //! Where the sequential scan has got to, written by whichever reader it moved into
   shared_ptr<atomic<idx_t>> progress_offset = make_shared_ptr<atomic<idx_t>>(0);

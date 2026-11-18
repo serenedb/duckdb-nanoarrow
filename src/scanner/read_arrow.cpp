@@ -41,11 +41,18 @@ namespace duckdb {
 namespace ext_nanoarrow {
 
 struct ReadArrowStream : ArrowTableFunction {
+  static vector<column_t> GetRowIdColumns(ClientContext& context,
+                                          optional_ptr<FunctionData> bind_data) {
+    return {MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX,
+            MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER};
+  }
+
   static TableFunction Function() {
     MultiFileFunction<ArrowMultiFileInfo> read_arrow("read_arrow");
     read_arrow.projection_pushdown = true;
     read_arrow.filter_pushdown = true;
     read_arrow.filter_prune = true;
+    read_arrow.get_row_id_columns = GetRowIdColumns;
     return static_cast<TableFunction>(read_arrow);
   }
 

@@ -50,6 +50,11 @@ struct ArrowFileLocalState : public LocalTableFunctionState {
   unique_ptr<GlobalTableFunctionState> local_arrow_global_state;
   unique_ptr<LocalTableFunctionState> local_arrow_local_state;
   unique_ptr<TableFunctionInput> table_function_input;
+
+  vector<ArrowIpcFileBlock> lookup_blocks;
+  vector<idx_t> lookup_ends;
+  SelectionVector lookup_rows;
+  DataChunk lookup_chunk;
 };
 
 struct ArrowFileGlobalState : public GlobalTableFunctionState {
@@ -108,6 +113,12 @@ struct ArrowMultiFileInfo : MultiFileReaderInterface {
     return true;
   }
 
+  bool SupportsLookup(const MultiFileBindData& bind_data,
+                      TableFunctionLookupInfo& info) const override;
+
+  void GetVirtualColumns(ClientContext& context, MultiFileBindData& bind_data,
+                         virtual_column_map_t& result) override;
+
   unique_ptr<GlobalTableFunctionState> InitializeGlobalState(
       ClientContext& context, MultiFileBindData& bind_data,
       MultiFileGlobalState& global_state) override;
@@ -136,6 +147,10 @@ struct ArrowMultiFileInfo : MultiFileReaderInterface {
   unique_ptr<NodeStatistics> GetCardinality(ClientContext& context,
                                             const MultiFileBindData& bind_data,
                                             idx_t file_count) override;
+
+  unique_ptr<MultiFileReaderInterface> Copy() override {
+    return make_uniq<ArrowMultiFileInfo>();
+  }
 };
 
 }  // namespace ext_nanoarrow

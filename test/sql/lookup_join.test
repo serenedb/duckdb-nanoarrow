@@ -1,0 +1,171 @@
+# name: test/sql/lookup_join.test
+# description: read_arrow numbers the rows of a file and fetches rows by their number for a LOOKUP_JOIN
+# group: [sql]
+
+require nanoarrow
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET profiling_renderer_settings = MAP {'operator_casing': 'upper'};
+
+statement ok
+CREATE TABLE src AS SELECT
+    i AS id,
+    i % 7 AS grp,
+    (i * 7919) % 1000 AS score,
+    md5(i::VARCHAR) AS name,
+    repeat(md5(i::VARCHAR), 4) AS payload,
+    CASE WHEN i % 10 = 0 THEN NULL ELSE (i * 0.01)::DECIMAL(18, 2) END AS price,
+    {'a': i, 'b': 'w' || i::VARCHAR} AS s,
+    [i, i + 1] AS l
+FROM range(40000) t(i);
+
+statement ok
+COPY src TO '{DATA_PATH}/lookup.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 5000);
+
+statement ok
+COPY (FROM src WHERE id < 10000) TO '{DATA_PATH}/lookup.arrows' (FORMAT ARROWS, ROW_GROUP_SIZE 5000);
+
+query III
+SELECT count(*), min(file_row_number), max(file_row_number) FROM read_arrow('{DATA_PATH}/lookup.arrow')
+----
+40000	0	39999
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE file_row_number != id
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE file_row_number BETWEEN 4990 AND 5010
+----
+21	105000
+
+query II
+SELECT count(*), sum(file_row_number) FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 AND id < 100
+----
+14	679
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/lookup.arrows') WHERE file_row_number != id
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT file_row_number) FROM read_arrow(['{DATA_PATH}/lookup.arrow', '{DATA_PATH}/lookup.arrows'])
+----
+50000	40000
+
+query II
+EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY id DESC LIMIT 3
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*file_row_number.*TOP_N.*
+
+query IIIII
+SELECT id, grp, name = md5(id::VARCHAR), s, l FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY id DESC LIMIT 3
+----
+39999	1	true	{'a': 39999, 'b': w39999}	[39999, 40000]
+39998	0	true	{'a': 39998, 'b': w39998}	[39998, 39999]
+39997	6	true	{'a': 39997, 'b': w39997}	[39997, 39998]
+
+query II
+EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY score, id DESC LIMIT 2000
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*TOP_N.*
+
+query I
+WITH plain AS MATERIALIZED (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow'))
+SELECT count(*) FROM (
+	(SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY score, id DESC LIMIT 2000) EXCEPT ALL SELECT * FROM (SELECT * FROM plain ORDER BY score, id DESC LIMIT 2000))
+	UNION ALL
+	(SELECT * FROM (SELECT * FROM plain ORDER BY score, id DESC LIMIT 2000) EXCEPT ALL SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY score, id DESC LIMIT 2000))
+)
+----
+0
+
+query II
+SELECT count(*), bool_and(payload = repeat(md5(id::VARCHAR), 4) AND s.a = id AND l[2] = id + 1 AND price IS NOT DISTINCT FROM (CASE WHEN id % 10 = 0 THEN NULL ELSE (id * 0.01)::DECIMAL(18, 2) END)) FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') ORDER BY score, id DESC LIMIT 2000)
+----
+2000	true
+
+query II
+EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 ORDER BY score, id LIMIT 100
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*TOP_N.*
+
+query I
+WITH plain AS MATERIALIZED (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow'))
+SELECT count(*) FROM (
+	(SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 ORDER BY score, id LIMIT 100) EXCEPT ALL SELECT * FROM (SELECT * FROM plain WHERE grp = 3 ORDER BY score, id LIMIT 100))
+	UNION ALL
+	(SELECT * FROM (SELECT * FROM plain WHERE grp = 3 ORDER BY score, id LIMIT 100) EXCEPT ALL SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 ORDER BY score, id LIMIT 100))
+)
+----
+0
+
+query I
+WITH plain AS MATERIALIZED (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow'))
+SELECT count(*) FROM (
+	(SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE price IS NULL AND id > 20000 ORDER BY score DESC, id LIMIT 30) EXCEPT ALL SELECT * FROM (SELECT * FROM plain WHERE price IS NULL AND id > 20000 ORDER BY score DESC, id LIMIT 30))
+	UNION ALL
+	(SELECT * FROM (SELECT * FROM plain WHERE price IS NULL AND id > 20000 ORDER BY score DESC, id LIMIT 30) EXCEPT ALL SELECT * FROM (SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE price IS NULL AND id > 20000 ORDER BY score DESC, id LIMIT 30))
+)
+----
+0
+
+query II
+EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 LIMIT 5
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*
+
+query III
+SELECT id, name = md5(id::VARCHAR), s.b FROM read_arrow('{DATA_PATH}/lookup.arrow') WHERE grp = 3 LIMIT 3
+----
+3	true	w3
+10	true	w10
+17	true	w17
+
+query II
+EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrows') ORDER BY id DESC LIMIT 3
+----
+physical_plan	<!REGEX>:.*LOOKUP_JOIN.*
+
+query II
+SELECT id, s.b FROM read_arrow('{DATA_PATH}/lookup.arrows') ORDER BY id DESC LIMIT 2
+----
+9999	w9999
+9998	w9998
+
+query II
+EXPLAIN SELECT * FROM read_arrow(['{DATA_PATH}/lookup.arrow', '{DATA_PATH}/lookup.arrows']) ORDER BY score, id LIMIT 50
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*TOP_N.*
+
+query I
+WITH plain AS MATERIALIZED (SELECT * FROM read_arrow(['{DATA_PATH}/lookup.arrow', '{DATA_PATH}/lookup.arrows']))
+SELECT count(*) FROM (
+	(SELECT * FROM (SELECT * FROM read_arrow(['{DATA_PATH}/lookup.arrow', '{DATA_PATH}/lookup.arrows']) ORDER BY score, id LIMIT 50) EXCEPT ALL SELECT * FROM (SELECT * FROM plain ORDER BY score, id LIMIT 50))
+	UNION ALL
+	(SELECT * FROM (SELECT * FROM plain ORDER BY score, id LIMIT 50) EXCEPT ALL SELECT * FROM (SELECT * FROM read_arrow(['{DATA_PATH}/lookup.arrow', '{DATA_PATH}/lookup.arrows']) ORDER BY score, id LIMIT 50))
+)
+----
+0
+
+query II
+EXPLAIN SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') ORDER BY v DESC LIMIT 3
+----
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*TOP_N.*
+
+query I
+WITH plain AS MATERIALIZED (SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow'))
+SELECT count(*) FROM (
+	(SELECT * FROM (SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') ORDER BY v % 997, v LIMIT 1000) EXCEPT ALL SELECT * FROM (SELECT * FROM plain ORDER BY v % 997, v LIMIT 1000))
+	UNION ALL
+	(SELECT * FROM (SELECT * FROM plain ORDER BY v % 997, v LIMIT 1000) EXCEPT ALL SELECT * FROM (SELECT * FROM read_arrow('__WORKING_DIRECTORY__/data/dictionary_file.arrow') ORDER BY v % 997, v LIMIT 1000))
+)
+----
+0

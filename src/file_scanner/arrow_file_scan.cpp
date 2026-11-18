@@ -1,3 +1,6 @@
+#include <algorithm>
+
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parallel/callback_async_task.hpp"
@@ -93,6 +96,8 @@ void ArrowFileScan::PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks,
 
 idx_t ArrowFileScan::ClaimCount() const { return MaxValue<idx_t>(claims.size(), 1); }
 
+bool ArrowFileScan::HasFooter() const { return !claims.empty(); }
+
 string ArrowFileScan::GetReaderType() const { return "ARROW"; }
 
 const vector<string>& ArrowFileScan::GetNames() { return names; }
@@ -153,7 +158,15 @@ void ArrowFileScan::InitializeScanData(ArrowFileLocalState& lstate,
   lstate.local_arrow_function_data->evaluate_filters = true;
   // Global column indexes and projection ids do not address this file's schema
   auto local_column_indexes = column_indexes;
-  if (local_column_indexes.empty()) {
+  bool reads_file_column = false;
+  for (idx_t i = 0; i < local_column_indexes.size(); i++) {
+    if (file_row_number.IsValid() && file_row_number.GetIndex() == i) {
+      local_column_indexes[i] = ColumnIndex(COLUMN_IDENTIFIER_ROW_NUMBER);
+    } else {
+      reads_file_column = true;
+    }
+  }
+  if (!reads_file_column) {
     // Only virtual or constant columns are read, so any file column yields the rows
     local_column_indexes.emplace_back(0);
   }
@@ -167,9 +180,52 @@ void ArrowFileScan::InitializeScanData(ArrowFileLocalState& lstate,
   }
 }
 
+void ArrowFileScan::OpenBlockReader(ArrowFileLocalState& lstate, bool read_columns) {
+  // The previous scan borrows the previous reader, so it goes first
+  lstate.table_function_input.reset();
+  lstate.local_arrow_local_state.reset();
+  lstate.local_arrow_global_state.reset();
+  lstate.block_scan_id = 0;
+  lstate.block_reader = factory->OpenReader();
+  // The schema comes from the footer copy, so a claim costs no read of the file start
+  lstate.block_reader->LoadFooter(ArrowBufferView{
+      {footer_window.get()}, static_cast<int64_t>(footer_window.GetSize())});
+  InitializeScanData(lstate, make_shared_ptr<BlockScanFactory>(*this, lstate));
+  // The fetch needs the projection before the scan that would push it starts
+  if (read_columns) {
+    vector<idx_t> projection;
+    for (const auto column_id : lstate.init_input->column_ids) {
+      if (!IsVirtualColumn(column_id)) {
+        projection.push_back(column_id);
+      }
+    }
+    if (!projection.empty()) {
+      lstate.block_reader->SetColumnProjection(projection);
+    }
+    // Claim readers share one set, since a file cannot replace its dictionaries
+    if (lstate.block_reader->NeedsDictionaries()) {
+      lock_guard<mutex> guard(dictionary_lock);
+      if (dictionaries) {
+        lstate.block_reader->ShareDictionaries(dictionaries);
+      } else {
+        lstate.block_reader->LoadDictionaries(dictionary_blocks);
+        // Shared buffers count their readers atomically only when nanoarrow has atomics
+        if (ArrowSharedBufferIsThreadSafe()) {
+          dictionaries = lstate.block_reader->Dictionaries();
+        }
+      }
+    }
+  }
+  lstate.block_scan_id = scan_id;
+}
+
 void ArrowFileScan::StartScan(ClientContext& context, ArrowFileLocalState& lstate) {
   lstate.local_arrow_global_state =
       ArrowTableFunction::ArrowScanInitGlobal(context, *lstate.init_input);
+  if (file_row_number.IsValid() && !claims.empty()) {
+    lstate.local_arrow_global_state->Cast<ArrowScanGlobalState>().next_row_number =
+        BatchStarts()[claims[lstate.claim_index].begin];
+  }
   lstate.local_arrow_local_state = ArrowTableFunction::ArrowScanInitLocalInternal(
       context, *lstate.init_input, lstate.local_arrow_global_state.get());
   lstate.table_function_input = make_uniq<TableFunctionInput>(
@@ -204,42 +260,7 @@ void ArrowFileScan::PrepareScan(ClientContext& context,
   }
   // A state keeps its reader for the next claim of the same file
   if (lstate.block_scan_id != scan_id) {
-    // The previous scan borrows the previous reader, so it goes first
-    lstate.table_function_input.reset();
-    lstate.local_arrow_local_state.reset();
-    lstate.local_arrow_global_state.reset();
-    lstate.block_scan_id = 0;
-    lstate.block_reader = factory->OpenReader();
-    // The schema comes from the footer copy, so a claim costs no read of the file start
-    lstate.block_reader->LoadFooter(ArrowBufferView{
-        {footer_window.get()}, static_cast<int64_t>(footer_window.GetSize())});
-    InitializeScanData(lstate, make_shared_ptr<BlockScanFactory>(*this, lstate));
-    // The fetch needs the projection before the scan that would push it starts
-    if (!count_only) {
-      vector<idx_t> projection;
-      for (const auto column_id : lstate.init_input->column_ids) {
-        if (column_id != COLUMN_IDENTIFIER_ROW_ID) {
-          projection.push_back(column_id);
-        }
-      }
-      if (!projection.empty()) {
-        lstate.block_reader->SetColumnProjection(projection);
-      }
-      // Claim readers share one set, since a file cannot replace its dictionaries
-      if (lstate.block_reader->NeedsDictionaries()) {
-        lock_guard<mutex> guard(dictionary_lock);
-        if (dictionaries) {
-          lstate.block_reader->ShareDictionaries(dictionaries);
-        } else {
-          lstate.block_reader->LoadDictionaries(dictionary_blocks);
-          // Shared buffers count their readers atomically only when nanoarrow has atomics
-          if (ArrowSharedBufferIsThreadSafe()) {
-            dictionaries = lstate.block_reader->Dictionaries();
-          }
-        }
-      }
-    }
-    lstate.block_scan_id = scan_id;
+    OpenBlockReader(lstate, !count_only);
   }
   const auto& claim = claims[lstate.claim_index];
   lstate.block_reader->SetBlocks(blocks.data() + claim.begin, blocks.data() + claim.end);
@@ -301,6 +322,193 @@ void ArrowFileScan::FinishClaim(ArrowFileLocalState& lstate) {
   lstate.local_arrow_global_state.reset();
   lstate.count_reader = nullptr;
   lstate.count_owned_reader.reset();
+}
+
+void ArrowFileScan::AddVirtualColumn(column_t virtual_column_id) {
+  if (virtual_column_id != MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+    throw InternalException("ArrowFileScan does not support virtual column %llu",
+                            virtual_column_id);
+  }
+  file_row_number = column_ids.size() - 1;
+}
+
+const vector<idx_t>& ArrowFileScan::BatchStarts() {
+  lock_guard<mutex> guard(batch_starts_lock);
+  if (!batch_starts.empty()) {
+    return batch_starts;
+  }
+  auto reader = factory->OpenReader();
+  reader->LoadFooter(ArrowBufferView{{footer_window.get()},
+                                     static_cast<int64_t>(footer_window.GetSize())});
+  vector<idx_t> starts{0};
+  if (count_without_bodies) {
+    reader->SetBlocks(blocks.data(), blocks.data() + blocks.size());
+    idx_t length;
+    while (reader->NextBatchLength(length)) {
+      starts.push_back(starts.back() + length);
+    }
+  } else {
+    reader->SetColumnProjection({0});
+    reader->LoadDictionaries(dictionary_blocks);
+    reader->SetBlocks(blocks.data(), blocks.data() + blocks.size());
+    nanoarrow::UniqueArray batch;
+    while (reader->GetNextBatch(batch.get())) {
+      starts.push_back(starts.back() + static_cast<idx_t>(batch->length));
+      batch.reset();
+    }
+  }
+  if (starts.size() != blocks.size() + 1) {
+    throw IOException(
+        "Arrow IPC file \"%s\" has %llu record batches, its footer names %llu",
+        GetFileName(), starts.size() - 1, blocks.size());
+  }
+  batch_starts = std::move(starts);
+  return batch_starts;
+}
+
+void ArrowFileScan::PrepareLookup(ClientContext& context, ArrowFileLocalState& lstate,
+                                  const DataChunk& chunk) {
+  if (claims.empty()) {
+    lstate.table_function_input.reset();
+    lstate.local_arrow_local_state.reset();
+    lstate.local_arrow_global_state.reset();
+    lstate.block_reader.reset();
+    InitializeScanData(lstate, factory);
+    lstate.block_scan_id = scan_id;
+  } else {
+    OpenBlockReader(lstate, true);
+  }
+  lstate.local_arrow_local_state =
+      ArrowTableFunction::ArrowScanCreateLocalState(context, *lstate.init_input);
+  lstate.lookup_rows.Initialize(STANDARD_VECTOR_SIZE);
+  lstate.lookup_chunk.Destroy();
+  lstate.lookup_chunk.Initialize(context, chunk.GetTypes());
+}
+
+idx_t ArrowFileScan::LookupBatch(ArrowFileLocalState& lstate,
+                                 shared_ptr<ArrowArrayWrapper> batch, idx_t batch_start,
+                                 std::span<const int64_t> rows, idx_t begin, idx_t end,
+                                 std::span<idx_t> survivors, DataChunk& chunk,
+                                 idx_t found) {
+  auto& scan_state = lstate.local_arrow_local_state->Cast<ArrowScanLocalState>();
+  scan_state.Reset();
+  scan_state.chunk = std::move(batch);
+  scan_state.row_number = batch_start;
+  auto& columns = arrow_table.GetColumns();
+  auto i = begin;
+  while (i < end) {
+    const auto window = (static_cast<idx_t>(rows[i]) - batch_start) /
+                        STANDARD_VECTOR_SIZE * STANDARD_VECTOR_SIZE;
+    idx_t count = 0;
+    auto next = i;
+    while (next < end &&
+           static_cast<idx_t>(rows[next]) - batch_start < window + STANDARD_VECTOR_SIZE) {
+      lstate.lookup_rows.set_index(count++,
+                                   static_cast<idx_t>(rows[next]) - batch_start - window);
+      next++;
+    }
+    scan_state.chunk_offset = window;
+    lstate.lookup_chunk.Reset();
+    const auto size = lstate.lookup_rows.get_index(count - 1) + 1;
+    const auto passed = ArrowTableFunction::ArrowToDuckDBFiltered(
+        scan_state, columns, lstate.lookup_chunk, size, lstate.lookup_rows, count);
+    for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+      VectorOperations::Copy(lstate.lookup_chunk.data[c], chunk.data[c], passed, 0,
+                             found);
+    }
+    for (idx_t r = 0; r < passed; r++) {
+      survivors[found + r] =
+          i + (passed < count ? scan_state.filter_selection.get_index(r) : r);
+    }
+    found += passed;
+    i = next;
+  }
+  return found;
+}
+
+void ArrowFileScan::Lookup(ClientContext& context, GlobalTableFunctionState& global_state,
+                           LocalTableFunctionState& local_state,
+                           std::span<const int64_t> rows, std::span<idx_t> survivors,
+                           DataChunk& chunk) {
+  auto& lstate = local_state.Cast<ArrowFileLocalState>();
+  if (lstate.block_scan_id != scan_id || !lstate.local_arrow_local_state) {
+    PrepareLookup(context, lstate, chunk);
+  }
+  idx_t found = 0;
+  idx_t i = 0;
+  while (i < rows.size() && rows[i] < 0) {
+    i++;
+  }
+  if (claims.empty()) {
+    auto reader = factory->OpenReader();
+    vector<idx_t> projection;
+    for (const auto column_id : lstate.init_input->column_ids) {
+      if (!IsVirtualColumn(column_id)) {
+        projection.push_back(column_id);
+      }
+    }
+    if (!projection.empty()) {
+      reader->SetColumnProjection(projection);
+    }
+    idx_t batch_start = 0;
+    while (i < rows.size()) {
+      auto batch = make_shared_ptr<ArrowArrayWrapper>();
+      if (!reader->GetNextBatch(&batch->arrow_array)) {
+        break;
+      }
+      const auto batch_end = batch_start + static_cast<idx_t>(batch->arrow_array.length);
+      auto end = i;
+      while (end < rows.size() && static_cast<idx_t>(rows[end]) < batch_end) {
+        end++;
+      }
+      if (end > i) {
+        found = LookupBatch(lstate, std::move(batch), batch_start, rows, i, end,
+                            survivors, chunk, found);
+      }
+      batch_start = batch_end;
+      i = end;
+    }
+    chunk.SetChildCardinality(found);
+    return;
+  }
+  const auto& starts = BatchStarts();
+  const auto min_group_bytes =
+      lstate.block_reader->IsRemote() ? kRemoteMinClaimBodyBytes : kMinClaimBodyBytes;
+  while (i < rows.size() && static_cast<idx_t>(rows[i]) < starts.back()) {
+    lstate.lookup_blocks.clear();
+    lstate.lookup_ends.clear();
+    idx_t group_bytes = 0;
+    auto end = i;
+    while (end < rows.size() && static_cast<idx_t>(rows[end]) < starts.back() &&
+           (lstate.lookup_blocks.empty() || group_bytes < min_group_bytes)) {
+      const auto row = static_cast<idx_t>(rows[end]);
+      const auto batch = static_cast<idx_t>(
+          std::upper_bound(starts.begin(), starts.end(), row) - starts.begin() - 1);
+      lstate.lookup_blocks.push_back(blocks[batch]);
+      group_bytes += static_cast<idx_t>(blocks[batch].body_length);
+      while (end < rows.size() && static_cast<idx_t>(rows[end]) < starts[batch + 1]) {
+        end++;
+      }
+      lstate.lookup_ends.push_back(end);
+    }
+    lstate.block_reader->SetBlocks(
+        lstate.lookup_blocks.data(),
+        lstate.lookup_blocks.data() + lstate.lookup_blocks.size());
+    for (idx_t b = 0; b < lstate.lookup_blocks.size(); b++) {
+      const auto row = static_cast<idx_t>(rows[i]);
+      const auto batch_start = *(std::upper_bound(starts.begin(), starts.end(), row) - 1);
+      auto batch = make_shared_ptr<ArrowArrayWrapper>();
+      if (!lstate.block_reader->GetNextBatch(&batch->arrow_array)) {
+        throw IOException(
+            "Arrow IPC file \"%s\" ended before a record batch its footer names",
+            GetFileName());
+      }
+      found = LookupBatch(lstate, std::move(batch), batch_start, rows, i,
+                          lstate.lookup_ends[b], survivors, chunk, found);
+      i = lstate.lookup_ends[b];
+    }
+  }
+  chunk.SetChildCardinality(found);
 }
 
 double ArrowFileScan::GetProgressInFile(ClientContext& context) {
