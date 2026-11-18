@@ -1,0 +1,74 @@
+# name: test/sql/filter_pushdown_types.test
+# description: A filtered read_arrow converts every Arrow type only for the rows that pass, to the values an unfiltered scan reads
+# group: [sql]
+
+require nanoarrow
+
+statement ok
+SET VARIABLE test_files = '__WORKING_DIRECTORY__/arrow-testing/data/arrow-ipc-stream/integration/1.0.0-littleendian/';
+
+statement ok
+CREATE MACRO arrow_file(name) AS getvariable('test_files') || name || '.stream';
+
+statement ok
+CREATE TABLE datetime_all AS FROM read_arrow(arrow_file('generated_datetime'));
+
+query I
+SELECT count(*) FROM (
+	(FROM read_arrow(arrow_file('generated_datetime')) WHERE f0 > DATE '1970-01-01' EXCEPT ALL FROM datetime_all WHERE f0 > DATE '1970-01-01')
+	UNION ALL
+	(FROM datetime_all WHERE f0 > DATE '1970-01-01' EXCEPT ALL FROM read_arrow(arrow_file('generated_datetime')) WHERE f0 > DATE '1970-01-01')
+)
+----
+0
+
+query I
+SELECT count(*) BETWEEN 1 AND (SELECT count(*) - 1 FROM datetime_all) FROM read_arrow(arrow_file('generated_datetime')) WHERE f0 > DATE '1970-01-01'
+----
+true
+
+statement ok
+CREATE TABLE decimal_all AS FROM read_arrow(arrow_file('generated_decimal'));
+
+query I
+SELECT count(*) FROM (
+	(FROM read_arrow(arrow_file('generated_decimal')) WHERE f0 > 0 EXCEPT ALL FROM decimal_all WHERE f0 > 0)
+	UNION ALL
+	(FROM decimal_all WHERE f0 > 0 EXCEPT ALL FROM read_arrow(arrow_file('generated_decimal')) WHERE f0 > 0)
+)
+----
+0
+
+query I
+SELECT count(*) BETWEEN 1 AND (SELECT count(*) - 1 FROM decimal_all) FROM read_arrow(arrow_file('generated_decimal')) WHERE f0 > 0
+----
+true
+
+statement ok
+CREATE TABLE primitive_all AS FROM read_arrow(arrow_file('generated_primitive'));
+
+query I
+SELECT count(*) FROM (
+	(FROM read_arrow(arrow_file('generated_primitive')) WHERE int32_nullable > 0 EXCEPT ALL FROM primitive_all WHERE int32_nullable > 0)
+	UNION ALL
+	(FROM primitive_all WHERE int32_nullable > 0 EXCEPT ALL FROM read_arrow(arrow_file('generated_primitive')) WHERE int32_nullable > 0)
+)
+----
+0
+
+query I
+SELECT count(*) BETWEEN 1 AND (SELECT count(*) - 1 FROM primitive_all) FROM read_arrow(arrow_file('generated_primitive')) WHERE int32_nullable > 0
+----
+true
+
+statement ok
+CREATE TABLE dictionary_all AS FROM read_arrow(arrow_file('generated_dictionary'));
+
+query I
+SELECT count(*) FROM (
+	(FROM read_arrow(arrow_file('generated_dictionary')) WHERE dict2 > 0 EXCEPT ALL FROM dictionary_all WHERE dict2 > 0)
+	UNION ALL
+	(FROM dictionary_all WHERE dict2 > 0 EXCEPT ALL FROM read_arrow(arrow_file('generated_dictionary')) WHERE dict2 > 0)
+)
+----
+0
