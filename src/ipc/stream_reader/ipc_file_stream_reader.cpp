@@ -270,6 +270,92 @@ void IPCFileStreamReader::LoadFooter(ArrowBufferView window) {
   SchemaFromFooter();
 }
 
+bool IPCFileStreamReader::TryIndexStream() {
+  if (!positional || remote || !record_batch_blocks.empty() ||
+      HasDictionary(*GetBaseSchema())) {
+    return false;
+  }
+  const auto file_size = file_reader.FileSize();
+  auto& handle = *file_reader.handle;
+  ArrowIpcMessagePrefix prefix{};
+  const auto read_prefix = [&](idx_t offset) {
+    if (offset % 8 != 0 || file_size - offset < sizeof(prefix)) {
+      return false;
+    }
+    handle.Read(&prefix, sizeof(prefix), offset);
+    return prefix.continuation_token == kContinuationToken && prefix.metadata_size >= 0;
+  };
+  auto scratch = NewDuckDBArrowDecoder();
+  ArrowError scratch_error{};
+  AllocatedData header;
+  const auto read_header = [&](idx_t offset, idx_t size) {
+    if (header.GetSize() < size) {
+      header = allocator.Allocate(size);
+    }
+    handle.Read(header.get(), size, offset);
+    return ArrowIpcDecoderVerifyHeader(
+               scratch.get(), AllocatedDataView(header.get(), static_cast<int64_t>(size)),
+               &scratch_error) == NANOARROW_OK &&
+           scratch->body_size_bytes >= 0;
+  };
+  if (!read_prefix(0) || prefix.metadata_size == 0) {
+    return false;
+  }
+  const auto schema_size = sizeof(prefix) + static_cast<idx_t>(prefix.metadata_size);
+  if (schema_size > file_size || !read_header(0, schema_size) ||
+      scratch->message_type != NANOARROW_IPC_MESSAGE_TYPE_SCHEMA ||
+      scratch->body_size_bytes != 0) {
+    return false;
+  }
+  auto schema = allocator.Allocate(schema_size);
+  std::memcpy(schema.get(), header.get(), schema_size);
+  vector<ArrowIpcFileBlock> blocks;
+  idx_t offset = schema_size;
+  while (offset < file_size) {
+    if (!read_prefix(offset)) {
+      return false;
+    }
+    if (prefix.metadata_size == 0) {
+      break;
+    }
+    const auto header_size = sizeof(prefix) + static_cast<idx_t>(prefix.metadata_size);
+    if (header_size > file_size - offset ||
+        header_size > static_cast<idx_t>(NumericLimits<int32_t>::Maximum()) ||
+        !read_header(offset, header_size) ||
+        scratch->message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
+      return false;
+    }
+    const auto body_size = static_cast<idx_t>(scratch->body_size_bytes);
+    if (body_size > file_size - offset - header_size) {
+      return false;
+    }
+    blocks.push_back(ArrowIpcFileBlock{static_cast<int64_t>(offset),
+                                       static_cast<int32_t>(header_size),
+                                       static_cast<int64_t>(body_size)});
+    offset += header_size + body_size;
+  }
+  if (blocks.empty()) {
+    return false;
+  }
+  record_batch_blocks = std::move(blocks);
+  schema_window = std::move(schema);
+  return true;
+}
+
+ArrowBufferView IPCFileStreamReader::SchemaWindow() const {
+  return AllocatedDataView(schema_window.get(),
+                           static_cast<int64_t>(schema_window.GetSize()));
+}
+
+void IPCFileStreamReader::LoadSchemaMessage(ArrowBufferView window) {
+  if (DecodeHeaderBuffer(window) ||
+      decoder->message_type != NANOARROW_IPC_MESSAGE_TYPE_SCHEMA) {
+    throw InternalException(
+        "LoadSchemaMessage needs the schema message TryIndexStream read");
+  }
+  DecodeSchema();
+}
+
 void IPCFileStreamReader::ReadFileEnd() {
   file_end_read = true;
   const auto file_size = file_reader.FileSize();

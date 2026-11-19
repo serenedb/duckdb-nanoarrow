@@ -43,6 +43,9 @@ class IPCFileStreamReader final : public IPCStreamReader {
   ArrowBufferView FooterWindow() const;
   //! Takes the schema from the footer another reader of the file read, instead of reading
   void LoadFooter(ArrowBufferView window);
+  bool TryIndexStream();
+  ArrowBufferView SchemaWindow() const;
+  void LoadSchemaMessage(ArrowBufferView window);
   //! The record batch blocks named by the footer, empty when there is no footer
   const vector<ArrowIpcFileBlock>& RecordBatchBlocks() const {
     return record_batch_blocks;
@@ -100,6 +103,7 @@ class IPCFileStreamReader final : public IPCStreamReader {
   bool footer_read = false;
   //! The footer, its size and the magic, for claim readers to take the schema from
   AllocatedData footer_window;
+  AllocatedData schema_window;
   //! Whether the end of the file was looked at, and whether it lacks the closing magic
   bool file_end_read = false;
   bool missing_footer = false;

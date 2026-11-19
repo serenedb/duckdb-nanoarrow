@@ -71,6 +71,7 @@ class ArrowFileScan : public BaseFileReader {
   void InitializeScanData(ArrowFileLocalState& lstate,
                           shared_ptr<ArrowScanFactory> producer);
   void OpenBlockReader(ArrowFileLocalState& lstate, bool read_columns);
+  void LoadIndex(IPCFileStreamReader& reader);
   void StartScan(ClientContext& context, ArrowFileLocalState& lstate);
   static void FinishClaim(ArrowFileLocalState& lstate);
   const vector<idx_t>& BatchStarts();
@@ -93,6 +94,7 @@ class ArrowFileScan : public BaseFileReader {
   vector<ArrowIpcFileBlock> dictionary_blocks;
   //! The footer, which claim readers take the schema from instead of reading the file
   AllocatedData footer_window;
+  bool indexed_stream = false;
   vector<BlockRange> claims;
   //! Whether a scan that reads no file column can count rows from the headers
   bool count_without_bodies = false;

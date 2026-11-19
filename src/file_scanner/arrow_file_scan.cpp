@@ -64,14 +64,25 @@ ArrowFileScan::ArrowFileScan(ClientContext& context, const OpenFileInfo& file)
   file_size = reader.FileSize();
   reader.TrackProgress(progress_offset);
   count_without_bodies = reader.CanCountWithoutBodies();
-  if (has_footer) {
+  if (has_footer || reader.TryIndexStream()) {
     PlanClaims(reader.RecordBatchBlocks(),
                reader.IsRemote() ? kRemoteMinClaimBodyBytes : kMinClaimBodyBytes);
     dictionary_blocks = reader.DictionaryBlocks();
-    const auto window = reader.FooterWindow();
+    indexed_stream = !has_footer;
+    const auto window = has_footer ? reader.FooterWindow() : reader.SchemaWindow();
     footer_window = factory->allocator.Allocate(static_cast<idx_t>(window.size_bytes));
     std::memcpy(footer_window.get(), window.data.data,
                 static_cast<size_t>(window.size_bytes));
+  }
+}
+
+void ArrowFileScan::LoadIndex(IPCFileStreamReader& reader) {
+  const ArrowBufferView window{{footer_window.get()},
+                               static_cast<int64_t>(footer_window.GetSize())};
+  if (indexed_stream) {
+    reader.LoadSchemaMessage(window);
+  } else {
+    reader.LoadFooter(window);
   }
 }
 
@@ -187,9 +198,7 @@ void ArrowFileScan::OpenBlockReader(ArrowFileLocalState& lstate, bool read_colum
   lstate.local_arrow_global_state.reset();
   lstate.block_scan_id = 0;
   lstate.block_reader = factory->OpenReader();
-  // The schema comes from the footer copy, so a claim costs no read of the file start
-  lstate.block_reader->LoadFooter(ArrowBufferView{
-      {footer_window.get()}, static_cast<int64_t>(footer_window.GetSize())});
+  LoadIndex(*lstate.block_reader);
   InitializeScanData(lstate, make_shared_ptr<BlockScanFactory>(*this, lstate));
   // The fetch needs the projection before the scan that would push it starts
   if (read_columns) {
@@ -338,8 +347,7 @@ const vector<idx_t>& ArrowFileScan::BatchStarts() {
     return batch_starts;
   }
   auto reader = factory->OpenReader();
-  reader->LoadFooter(ArrowBufferView{{footer_window.get()},
-                                     static_cast<int64_t>(footer_window.GetSize())});
+  LoadIndex(*reader);
   vector<idx_t> starts{0};
   if (count_without_bodies) {
     reader->SetBlocks(blocks.data(), blocks.data() + blocks.size());

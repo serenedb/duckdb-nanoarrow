@@ -132,7 +132,7 @@ SELECT id, name = md5(id::VARCHAR), s.b FROM read_arrow('{DATA_PATH}/lookup.arro
 query II
 EXPLAIN SELECT * FROM read_arrow('{DATA_PATH}/lookup.arrows') ORDER BY id DESC LIMIT 3
 ----
-physical_plan	<!REGEX>:.*LOOKUP_JOIN.*
+physical_plan	<REGEX>:.*LOOKUP_JOIN.*TOP_N.*
 
 query II
 SELECT id, s.b FROM read_arrow('{DATA_PATH}/lookup.arrows') ORDER BY id DESC LIMIT 2
