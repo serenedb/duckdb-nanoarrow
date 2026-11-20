@@ -1,0 +1,65 @@
+# name: test/sql/filter_pushdown_written_types.test
+# description: A filtered read_arrow of the types DuckDB writes converts the other columns only for the rows that pass, to the values an unfiltered scan reads
+# group: [sql]
+
+require nanoarrow
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+CREATE TABLE written AS SELECT
+	i AS id,
+	to_days(i::INTEGER) + to_months((i % 7)::INTEGER) + to_microseconds(i * 1000) AS iv,
+	CASE WHEN i % 5 = 0 THEN NULL ELSE to_hours(i) END AS iv_null,
+	('00000000-0000-0000-0000-' || lpad(i::VARCHAR, 12, '0'))::UUID AS u,
+	CASE WHEN i % 6 = 0 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad(i::VARCHAR, 12, '0'))::UUID END AS u_null,
+	TIMESTAMP '2024-01-01' + to_seconds(i) AS ts,
+	(TIMESTAMP '2024-01-01' + to_seconds(i))::TIMESTAMP_S AS ts_s,
+	(TIMESTAMP '2024-01-01' + to_seconds(i))::TIMESTAMP_MS AS ts_ms,
+	(TIMESTAMP '2024-01-01' + to_seconds(i))::TIMESTAMP_NS AS ts_ns,
+	(TIMESTAMP '2024-01-01' + to_seconds(i))::TIMESTAMPTZ AS tstz,
+	TIME '00:00:00' + to_seconds(i) AS t,
+	(i / 10)::DECIMAL(4, 1) AS d4,
+	(i / 100)::DECIMAL(9, 2) AS d9,
+	(i / 1000)::DECIMAL(18, 3) AS d18,
+	(i / 7)::DECIMAL(38, 10) AS d38,
+	's' || i || repeat('x', i % 20) AS s,
+	CASE WHEN i % 4 = 0 THEN NULL ELSE 'n' || i END AS s_null
+FROM range(3000) r(i);
+
+foreach setting arrow_large_buffer_size arrow_lossless_conversion
+
+statement ok
+SET ${setting} = true;
+
+statement ok
+COPY written TO '{DATA_PATH}/written_${setting}.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 1000);
+
+statement ok
+SET ${setting} = false;
+
+endloop
+
+statement ok
+COPY written TO '{DATA_PATH}/written_default.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 1000);
+
+foreach file default arrow_large_buffer_size arrow_lossless_conversion
+
+statement ok
+CREATE TABLE written_${file} AS FROM read_arrow('{DATA_PATH}/written_${file}.arrow');
+
+query I
+SELECT count(*) FROM (
+	(FROM read_arrow('{DATA_PATH}/written_${file}.arrow') WHERE id > 1234 EXCEPT ALL FROM written_${file} WHERE id > 1234)
+	UNION ALL
+	(FROM written_${file} WHERE id > 1234 EXCEPT ALL FROM read_arrow('{DATA_PATH}/written_${file}.arrow') WHERE id > 1234)
+)
+----
+0
+
+query II
+SELECT count(*), count(DISTINCT id) FROM read_arrow('{DATA_PATH}/written_${file}.arrow') WHERE id > 1234
+----
+1765	1765
+
+endloop
