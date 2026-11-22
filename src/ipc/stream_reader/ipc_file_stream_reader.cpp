@@ -408,17 +408,12 @@ void IPCFileStreamReader::CheckInFile(idx_t start, idx_t size) {
 
 void IPCFileStreamReader::ReadBodyPositionally(idx_t body_start, idx_t body_size) {
   // A body smaller than the buffer reads through it, which also buffers the next header
-  if (body_size < FILE_BUFFER_SIZE) {
+  if (body_size < BufferedFileReader::BUFFER_SIZE) {
     ReadData(message_body->get(), body_size);
     return;
   }
-  // Reading the header usually buffered the start of the body, so copy it, not reread it
-  const auto buffered =
-      MinValue<idx_t>(file_reader.read_data - file_reader.offset, body_size);
-  ReadData(message_body->get(), buffered);
-  // Positional reads replace the 4 KB reads the buffered reader would issue
-  ReadAt(*file_reader.handle, FileRead{message_body->get() + buffered,
-                                       body_size - buffered, body_start + buffered});
+  // One positional read replaces the buffer-sized reads the buffered reader would issue
+  ReadAt(*file_reader.handle, FileRead{message_body->get(), body_size, body_start});
   file_reader.Seek(body_start + body_size);
 }
 
@@ -517,7 +512,7 @@ void IPCFileStreamReader::DecodeBody() {
       SetUnreadBody(body_size);
       return;
     }
-    if (body_size >= FILE_BUFFER_SIZE && positional) {
+    if (body_size >= BufferedFileReader::BUFFER_SIZE && positional) {
       file_reader.Seek(body_start + body_size);
       SetUnreadBody(body_size);
       return;

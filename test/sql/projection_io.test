@@ -54,9 +54,9 @@ SELECT count(*) FROM read_arrow('__TEST_DIR__/io_count.arrows');
 ----
 20000
 
-# Counting reads the message headers only, where one column alone is 160 KB
+# Counting reads the message headers only, a 64 KiB buffer at a time, where one column alone is 160 KB
 query I
-SELECT sum(bytes) < 40000 FROM duckdb_logs_parsed('FileSystem')
+SELECT sum(bytes) < 160000 FROM duckdb_logs_parsed('FileSystem')
 WHERE op = 'READ' AND path LIKE '%io_count.arrows%';
 ----
 true
