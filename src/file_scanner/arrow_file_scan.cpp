@@ -74,6 +74,14 @@ ArrowFileScan::ArrowFileScan(ClientContext& context, const OpenFileInfo& file)
     footer_window = factory->allocator.Allocate(static_cast<idx_t>(window.size_bytes));
     std::memcpy(footer_window.get(), window.data.data,
                 static_cast<size_t>(window.size_bytes));
+  } else if (reader.ClaimsStream()) {
+    stream_claims = true;
+    stream_threads = TaskScheduler::QueryThreads(context);
+    indexed_stream = true;
+    const auto window = reader.MessageWindow();
+    footer_window = factory->allocator.Allocate(static_cast<idx_t>(window.size_bytes));
+    std::memcpy(footer_window.get(), window.data.data,
+                static_cast<size_t>(window.size_bytes));
   }
 }
 
@@ -106,7 +114,12 @@ void ArrowFileScan::PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks,
   blocks = file_blocks;
 }
 
-idx_t ArrowFileScan::ClaimCount() const { return MaxValue<idx_t>(claims.size(), 1); }
+idx_t ArrowFileScan::ClaimCount() const {
+  if (stream_claims) {
+    return stream_threads;
+  }
+  return MaxValue<idx_t>(claims.size(), 1);
+}
 
 bool ArrowFileScan::HasFooter() const { return !claims.empty(); }
 
@@ -118,6 +131,16 @@ const vector<LogicalType>& ArrowFileScan::GetTypes() { return types; }
 bool ArrowFileScan::TryInitializeScan(ClientContext& context,
                                       GlobalTableFunctionState& gstate_p,
                                       LocalTableFunctionState& lstate_p) {
+  if (StreamClaims()) {
+    auto& lstate = lstate_p.Cast<ArrowFileLocalState>();
+    auto& reader = static_cast<IPCFileStreamReader&>(*factory->reader);
+    if (stream_done || !reader.ReadMessages(kMinClaimBodyBytes, lstate.stream_messages)) {
+      stream_done = true;
+      return false;
+    }
+    lstate.claim_index = next_claim++;
+    return true;
+  }
   if (!claims.empty()) {
     // Claims go out in file order under the multi file lock, which keeps batch order
     if (next_claim >= claims.size()) {
@@ -254,6 +277,17 @@ void ArrowFileScan::PrepareScan(ClientContext& context,
   lstate.count_rows_left = 0;
   // Only virtual or constant columns are read, so the headers alone give the rows
   const bool count_only = column_indexes.empty() && count_without_bodies;
+  if (StreamClaims()) {
+    if (lstate.block_scan_id != scan_id) {
+      OpenBlockReader(lstate, !count_only);
+    }
+    lstate.block_reader->SetMessages(std::move(lstate.stream_messages));
+    if (count_only) {
+      lstate.block_reader->CountOnly();
+      lstate.count_reader = lstate.block_reader.get();
+    }
+    return;
+  }
   if (claims.empty()) {
     lstate.block_scan_id = 0;
     if (count_only) {

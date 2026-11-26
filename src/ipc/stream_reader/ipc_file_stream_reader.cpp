@@ -831,6 +831,10 @@ ArrowIpcMessageType IPCFileStreamReader::DecodeFetchedBlock(
     if (skip_bodies && !NeedsEndianSwap() &&
         decoder->codec == NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
       SetUnreadBody(body_size);
+    } else if (fetched.body) {
+      message_body = fetched.body;
+      cur_ptr = fetched.body_ptr;
+      cur_size = static_cast<int64_t>(body_size);
     } else if (skip_bodies) {
       // Only the header was fetched, and a swapped or compressed body is read to count it
       const auto body_start =
@@ -882,6 +886,39 @@ void IPCFileStreamReader::SetBlocks(const ArrowIpcFileBlock* begin,
   finished = false;
   fetched_blocks.clear();
   fetched_index = 0;
+}
+
+bool IPCFileStreamReader::ClaimsStream() {
+  return !positional && !HasDictionary(*GetBaseSchema());
+}
+
+ArrowBufferView IPCFileStreamReader::MessageWindow() const {
+  return AllocatedDataView(message_header.get(), decoder->header_size_bytes);
+}
+
+bool IPCFileStreamReader::ReadMessages(idx_t min_body_bytes, StreamMessages& out) {
+  out = StreamMessages();
+  idx_t body_bytes = 0;
+  while (body_bytes < min_body_bytes &&
+         IPCStreamReader::ReadNextMessage({NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH}) !=
+             NANOARROW_IPC_MESSAGE_TYPE_UNINITIALIZED) {
+    const auto header_size = static_cast<idx_t>(decoder->header_size_bytes);
+    auto header = make_shared_ptr<AllocatedData>(allocator.Allocate(header_size));
+    std::memcpy(header->get(), message_header.get(), header_size);
+    const auto header_ptr = header->get();
+    out.blocks.push_back(
+        ArrowIpcFileBlock{0, static_cast<int32_t>(header_size), cur_size});
+    out.fetched.push_back(
+        FetchedBlock{std::move(header), header_ptr, std::move(message_body), cur_ptr});
+    body_bytes += static_cast<idx_t>(cur_size);
+  }
+  return !out.blocks.empty();
+}
+
+void IPCFileStreamReader::SetMessages(StreamMessages messages) {
+  message_blocks = std::move(messages.blocks);
+  SetBlocks(message_blocks.data(), message_blocks.data() + message_blocks.size());
+  fetched_blocks = std::move(messages.fetched);
 }
 
 ArrowIpcMessageType IPCFileStreamReader::ReadNextMessage() {

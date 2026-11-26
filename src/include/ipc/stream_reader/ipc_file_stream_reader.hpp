@@ -23,6 +23,17 @@ struct BodyRange {
 //! IPC File
 class IPCFileStreamReader final : public IPCStreamReader {
  public:
+  struct FetchedBlock {
+    shared_ptr<void> data;
+    const_data_ptr_t ptr = nullptr;
+    shared_ptr<void> body;
+    const_data_ptr_t body_ptr = nullptr;
+  };
+  struct StreamMessages {
+    vector<ArrowIpcFileBlock> blocks;
+    vector<FetchedBlock> fetched;
+  };
+
   //! A scheduler lets the reads of one fetch of a remote file run at the same time
   IPCFileStreamReader(FileSystem& fs, unique_ptr<FileHandle> handle, Allocator& allocator,
                       optional_ptr<TaskScheduler> scheduler = nullptr,
@@ -79,14 +90,12 @@ class IPCFileStreamReader final : public IPCStreamReader {
   void CountOnly();
   //! Reads the length of the next record batch and skips its body, false at the end
   bool NextBatchLength(idx_t& length);
+  bool ClaimsStream();
+  ArrowBufferView MessageWindow() const;
+  bool ReadMessages(idx_t min_body_bytes, StreamMessages& out);
+  void SetMessages(StreamMessages messages);
 
  private:
-  //! Where one claimed block starts in memory once fetched
-  struct FetchedBlock {
-    shared_ptr<void> data;
-    const_data_ptr_t ptr = nullptr;
-  };
-
   BufferedFileReader file_reader;
   AllocatedData message_header;
   shared_ptr<void> message_body;
@@ -101,6 +110,7 @@ class IPCFileStreamReader final : public IPCStreamReader {
   //! The claimed blocks in memory, empty until FetchBlocks runs
   vector<FetchedBlock> fetched_blocks;
   idx_t fetched_index = 0;
+  vector<ArrowIpcFileBlock> message_blocks;
   shared_ptr<atomic<idx_t>> progress_offset;
   vector<ArrowIpcFileBlock> record_batch_blocks;
   vector<ArrowIpcFileBlock> dictionary_blocks;

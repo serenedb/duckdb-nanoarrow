@@ -68,6 +68,7 @@ class ArrowFileScan : public BaseFileReader {
 
   //! Groups the footer blocks into claims of at least this many body bytes
   void PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks, idx_t min_claim_bytes);
+  bool StreamClaims() const { return stream_claims && !file_row_number.IsValid(); }
   void InitializeScanData(ArrowFileLocalState& lstate,
                           shared_ptr<ArrowScanFactory> producer);
   void OpenBlockReader(ArrowFileLocalState& lstate, bool read_columns);
@@ -95,6 +96,9 @@ class ArrowFileScan : public BaseFileReader {
   //! The footer, which claim readers take the schema from instead of reading the file
   AllocatedData footer_window;
   bool indexed_stream = false;
+  bool stream_claims = false;
+  bool stream_done = false;
+  idx_t stream_threads = 1;
   vector<BlockRange> claims;
   //! Whether a scan that reads no file column can count rows from the headers
   bool count_without_bodies = false;

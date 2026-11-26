@@ -31,6 +31,7 @@ struct ArrowFileLocalState : public LocalTableFunctionState {
   idx_t block_scan_id = 0;
   //! The claim that TryInitializeScan handed to this state
   idx_t claim_index = 0;
+  IPCFileStreamReader::StreamMessages stream_messages;
   //! Set when no file column is read, so the scan only counts rows from the headers
   optional_ptr<IPCFileStreamReader> count_reader;
   //! Owns the reader of a counting scan without claims
