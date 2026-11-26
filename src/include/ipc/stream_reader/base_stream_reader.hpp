@@ -104,7 +104,7 @@ class IPCStreamReader {
   nanoarrow::UniqueSchema base_schema;
 
   //! Information on current buffer
-  data_ptr_t cur_ptr{};
+  const_data_ptr_t cur_ptr{};
   int64_t cur_size{};
 
   //! Allocator used to allocate buffers with decoded arrow information

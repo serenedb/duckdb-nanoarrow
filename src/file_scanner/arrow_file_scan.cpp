@@ -65,6 +65,7 @@ ArrowFileScan::ArrowFileScan(ClientContext& context, const OpenFileInfo& file)
   reader.TrackProgress(progress_offset);
   count_without_bodies = reader.CanCountWithoutBodies();
   if (has_footer || reader.TryIndexStream()) {
+    factory->mapping = reader.MapFile(context);
     PlanClaims(reader.RecordBatchBlocks(),
                reader.IsRemote() ? kRemoteMinClaimBodyBytes : kMinClaimBodyBytes);
     dictionary_blocks = reader.DictionaryBlocks();

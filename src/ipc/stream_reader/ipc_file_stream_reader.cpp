@@ -3,6 +3,8 @@
 #include <algorithm>
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/memory_mapped_file.hpp"
+#include "duckdb/formats/row_input.hpp"
 #include "ipc/file_format.hpp"
 
 namespace duckdb {
@@ -141,14 +143,26 @@ bool CopyFooterBlocks(const ArrowBuffer& source, idx_t file_size,
 }  // namespace
 IPCFileStreamReader::IPCFileStreamReader(FileSystem& fs, unique_ptr<FileHandle> handle,
                                          Allocator& allocator,
-                                         optional_ptr<TaskScheduler> scheduler)
-    : IPCStreamReader(allocator), file_reader(fs, std::move(handle)) {
+                                         optional_ptr<TaskScheduler> scheduler,
+                                         shared_ptr<MemoryMappedFile> mapping)
+    : IPCStreamReader(allocator),
+      file_reader(fs, std::move(handle)),
+      mapping(std::move(mapping)) {
   // Regular and remote files read at an offset, and asking a remote one its type opens it
   remote = FileSystem::IsRemoteFile(file_reader.handle->GetPath());
   positional = remote || file_reader.handle->GetType() == FileType::FILE_TYPE_REGULAR;
   if (remote) {
     this->scheduler = scheduler;
   }
+}
+
+shared_ptr<MemoryMappedFile> IPCFileStreamReader::MapFile(ClientContext& context) {
+  if (!positional || remote) {
+    return nullptr;
+  }
+  auto& handle = *file_reader.handle;
+  return shared_ptr<MemoryMappedFile>(MapForReading(
+      context, handle.GetPath(), handle.OnDiskFile(), file_reader.FileSize(), 0));
 }
 
 bool IPCFileStreamReader::TryReadFooter() {
@@ -406,14 +420,15 @@ void IPCFileStreamReader::CheckInFile(idx_t start, idx_t size) {
   }
 }
 
-void IPCFileStreamReader::ReadBodyPositionally(idx_t body_start, idx_t body_size) {
+void IPCFileStreamReader::ReadBodyPositionally(data_ptr_t body, idx_t body_start,
+                                               idx_t body_size) {
   // A body smaller than the buffer reads through it, which also buffers the next header
   if (body_size < BufferedFileReader::BUFFER_SIZE) {
-    ReadData(message_body->get(), body_size);
+    ReadData(body, body_size);
     return;
   }
   // One positional read replaces the buffer-sized reads the buffered reader would issue
-  ReadAt(*file_reader.handle, FileRead{message_body->get(), body_size, body_start});
+  ReadAt(*file_reader.handle, FileRead{body, body_size, body_start});
   file_reader.Seek(body_start + body_size);
 }
 
@@ -477,15 +492,15 @@ bool IPCFileStreamReader::ProjectedRanges(const_data_ptr_t base, idx_t body_size
          static_cast<double>(body_size) * kMaxProjectedFraction;
 }
 
-bool IPCFileStreamReader::TryReadProjectedBody(idx_t body_start, idx_t body_size) {
+bool IPCFileStreamReader::TryReadProjectedBody(data_ptr_t body, idx_t body_start,
+                                               idx_t body_size) {
   vector<BodyRange> merged;
-  if (!ProjectedRanges(message_body->get(), body_size, merged)) {
+  if (!ProjectedRanges(body, body_size, merged)) {
     return false;
   }
   for (const auto& range : merged) {
-    ReadAt(*file_reader.handle,
-           FileRead{message_body->get() + range.begin, range.end - range.begin,
-                    body_start + range.begin});
+    ReadAt(*file_reader.handle, FileRead{body + range.begin, range.end - range.begin,
+                                         body_start + range.begin});
   }
   file_reader.Seek(body_start + body_size);
   return true;
@@ -518,18 +533,19 @@ void IPCFileStreamReader::DecodeBody() {
       return;
     }
   }
-  message_body = make_shared_ptr<AllocatedData>(allocator.Allocate(body_size));
+  auto body = make_shared_ptr<AllocatedData>(allocator.Allocate(body_size));
   if (scheduler) {
-    SequentialRead(message_body->get(), body_size);
+    SequentialRead(body->get(), body_size);
   } else if (positional) {
-    if (!TryReadProjectedBody(body_start, body_size)) {
-      ReadBodyPositionally(body_start, body_size);
+    if (!TryReadProjectedBody(body->get(), body_start, body_size)) {
+      ReadBodyPositionally(body->get(), body_start, body_size);
     }
   } else {
-    ReadData(message_body->get(), body_size);
+    ReadData(body->get(), body_size);
   }
-  cur_ptr = message_body->get();
+  cur_ptr = body->get();
   cur_size = static_cast<int64_t>(body_size);
+  message_body = std::move(body);
 }
 
 void IPCFileStreamReader::SetUnreadBody(idx_t size) {
@@ -661,7 +677,15 @@ void IPCFileStreamReader::FetchBlocks(bool whole) {
   vector<FileRead> reads;
   PlanRuns(whole_blocks, skip_bodies, fetched, reads);
   // The header says where the projected buffers are, so it comes first
-  PlanRuns(ranged_blocks, true, fetched, reads);
+  if (mapping) {
+    for (const auto i : ranged_blocks) {
+      const auto& block = next_block[i];
+      ReadInPlace(static_cast<idx_t>(block.offset),
+                  static_cast<idx_t>(block.metadata_length));
+    }
+  } else {
+    PlanRuns(ranged_blocks, true, fetched, reads);
+  }
   ReadAll(reads);
   reads.clear();
   for (const auto i : ranged_blocks) {
@@ -694,11 +718,21 @@ void IPCFileStreamReader::PlanRuns(const vector<idx_t>& indexes, bool headers_on
       }
       end = end_of(block);
     }
-    auto data = make_shared_ptr<AllocatedData>(allocator.Allocate(end - begin));
-    reads.push_back(FileRead{data->get(), end - begin, begin});
+    shared_ptr<void> owner;
+    const_data_ptr_t run;
+    if (mapping && !headers_only) {
+      owner = MappedOwner(begin, end);
+      run = mapping->GetData(begin, end - begin);
+      ReadInPlace(begin, end - begin);
+    } else {
+      auto data = make_shared_ptr<AllocatedData>(allocator.Allocate(end - begin));
+      reads.push_back(FileRead{data->get(), end - begin, begin});
+      run = data->get();
+      owner = std::move(data);
+    }
     for (idx_t k = i; k < j; k++) {
       const auto offset = static_cast<idx_t>(next_block[indexes[k]].offset);
-      fetched[indexes[k]] = FetchedBlock{data, data->get() + (offset - begin)};
+      fetched[indexes[k]] = FetchedBlock{owner, run + (offset - begin)};
     }
     i = j;
   }
@@ -709,22 +743,35 @@ void IPCFileStreamReader::PlanProjectedBlock(const ArrowIpcFileBlock& block,
                                              vector<FileRead>& reads) {
   const auto metadata_size = static_cast<idx_t>(block.metadata_length);
   const auto body_size = static_cast<idx_t>(block.body_length);
-  auto data =
-      make_shared_ptr<AllocatedData>(allocator.Allocate(metadata_size + body_size));
-  std::memcpy(data->get(), fetched.ptr, metadata_size);
-  fetched = FetchedBlock{data, data->get()};
+  const auto block_start = static_cast<idx_t>(block.offset);
+  data_ptr_t body = nullptr;
+  if (mapping) {
+    fetched =
+        FetchedBlock{MappedOwner(block_start, block_start + metadata_size + body_size),
+                     mapping->GetData(block_start, metadata_size + body_size)};
+  } else {
+    auto data =
+        make_shared_ptr<AllocatedData>(allocator.Allocate(metadata_size + body_size));
+    std::memcpy(data->get(), fetched.ptr, metadata_size);
+    body = data->get() + metadata_size;
+    fetched = FetchedBlock{std::move(data), body - metadata_size};
+  }
 
   vector<BodyRange> ranges;
-  const auto body = data->get() + metadata_size;
   // The header decodes here only to find the buffers, the scan decodes it again
-  if (!DecodeBlockHeader(block, fetched) || !ProjectedRanges(body, body_size, ranges)) {
+  if (!DecodeBlockHeader(block, fetched) ||
+      !ProjectedRanges(fetched.ptr + metadata_size, body_size, ranges)) {
     ranges.clear();
     ranges.push_back(BodyRange{0, body_size});
   }
-  const auto body_start = static_cast<idx_t>(block.offset) + metadata_size;
+  const auto body_start = block_start + metadata_size;
   for (const auto& range : ranges) {
-    reads.push_back(
-        FileRead{body + range.begin, range.end - range.begin, body_start + range.begin});
+    if (mapping) {
+      ReadInPlace(body_start + range.begin, range.end - range.begin);
+    } else {
+      reads.push_back(FileRead{body + range.begin, range.end - range.begin,
+                               body_start + range.begin});
+    }
   }
 }
 
@@ -737,6 +784,15 @@ void IPCFileStreamReader::ReadAll(const vector<FileRead>& reads) {
   for (const auto& read : reads) {
     ReadAt(*file_reader.handle, read);
   }
+}
+
+void IPCFileStreamReader::ReadInPlace(idx_t location, idx_t size) {
+  mapping->PrefetchMissing(location, size);
+  file_reader.handle->ReadInPlace(QueryContext(), size, location);
+}
+
+shared_ptr<void> IPCFileStreamReader::MappedOwner(idx_t begin, idx_t end) const {
+  return make_shared_ptr<MappedRange>(mapping, begin, end);
 }
 
 bool IPCFileStreamReader::DecodeBlockHeader(const ArrowIpcFileBlock& block,
@@ -777,12 +833,18 @@ ArrowIpcMessageType IPCFileStreamReader::DecodeFetchedBlock(
       SetUnreadBody(body_size);
     } else if (skip_bodies) {
       // Only the header was fetched, and a swapped or compressed body is read to count it
-      message_body = make_shared_ptr<AllocatedData>(allocator.Allocate(body_size));
-      ReadAt(*file_reader.handle,
-             FileRead{message_body->get(), body_size,
-                      static_cast<idx_t>(block.offset) +
-                          static_cast<idx_t>(block.metadata_length)});
-      cur_ptr = message_body->get();
+      const auto body_start =
+          static_cast<idx_t>(block.offset) + static_cast<idx_t>(block.metadata_length);
+      if (mapping) {
+        ReadInPlace(body_start, body_size);
+        message_body = MappedOwner(body_start, body_start + body_size);
+        cur_ptr = mapping->GetData(body_start, body_size);
+      } else {
+        auto body = make_shared_ptr<AllocatedData>(allocator.Allocate(body_size));
+        ReadAt(*file_reader.handle, FileRead{body->get(), body_size, body_start});
+        cur_ptr = body->get();
+        message_body = std::move(body);
+      }
       cur_size = static_cast<int64_t>(body_size);
     } else {
       message_body = fetched.data;

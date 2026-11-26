@@ -25,9 +25,12 @@ class IPCFileStreamReader final : public IPCStreamReader {
  public:
   //! A scheduler lets the reads of one fetch of a remote file run at the same time
   IPCFileStreamReader(FileSystem& fs, unique_ptr<FileHandle> handle, Allocator& allocator,
-                      optional_ptr<TaskScheduler> scheduler = nullptr);
+                      optional_ptr<TaskScheduler> scheduler = nullptr,
+                      shared_ptr<MemoryMappedFile> mapping = nullptr);
 
   ArrowIpcMessageType ReadNextMessage() override;
+
+  shared_ptr<MemoryMappedFile> MapFile(ClientContext& context);
 
   //! Publishes the offset of each message it reaches, for progress read on another thread
   void TrackProgress(shared_ptr<atomic<idx_t>> offset);
@@ -80,13 +83,14 @@ class IPCFileStreamReader final : public IPCStreamReader {
  private:
   //! Where one claimed block starts in memory once fetched
   struct FetchedBlock {
-    shared_ptr<AllocatedData> data;
-    data_ptr_t ptr = nullptr;
+    shared_ptr<void> data;
+    const_data_ptr_t ptr = nullptr;
   };
 
   BufferedFileReader file_reader;
   AllocatedData message_header;
-  shared_ptr<AllocatedData> message_body;
+  shared_ptr<void> message_body;
+  shared_ptr<MemoryMappedFile> mapping;
   //! Pipes and character devices must keep the sequential read
   bool positional = false;
   bool remote = false;
@@ -125,9 +129,9 @@ class IPCFileStreamReader final : public IPCStreamReader {
   //! Rejects a message part that runs past the end of a file whose size is known
   void CheckInFile(idx_t start, idx_t size);
   //! Reads a whole body, small ones through the buffer and large ones positionally
-  void ReadBodyPositionally(idx_t body_start, idx_t body_size);
+  void ReadBodyPositionally(data_ptr_t body, idx_t body_start, idx_t body_size);
   //! Reads only the buffers the projection needs, returns false to read the whole body
-  bool TryReadProjectedBody(idx_t body_start, idx_t body_size);
+  bool TryReadProjectedBody(data_ptr_t body, idx_t body_start, idx_t body_size);
   //! The merged body ranges the projection needs, false when the whole body is cheaper
   bool ProjectedRanges(const_data_ptr_t base, idx_t body_size, vector<BodyRange>& merged);
   //! Ranges closer than this are read together
@@ -142,6 +146,8 @@ class IPCFileStreamReader final : public IPCStreamReader {
                           vector<FileRead>& reads);
   //! Runs planned reads, at the same time when the file is remote
   void ReadAll(const vector<FileRead>& reads);
+  void ReadInPlace(idx_t location, idx_t size);
+  shared_ptr<void> MappedOwner(idx_t begin, idx_t end) const;
   //! Points the current body at the stand in a count reads no bytes of
   void SetUnreadBody(idx_t size);
   //! Decodes the header of a fetched block, false for an end of stream marker

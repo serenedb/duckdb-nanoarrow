@@ -1,0 +1,105 @@
+# name: test/sql/mapped_file.test
+# description: A local file of 2 MiB or more is read in place: projected ranges, counted bodies and batches larger than the memory limit
+# group: [sql]
+
+require nanoarrow
+
+require noforcestorage
+
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+COPY (SELECT i AS c0, i AS c1, i AS c2, i AS c3, i AS c4, i AS c5, i AS c6, i AS c7
+      FROM range(40000) t(i))
+TO '__TEST_DIR__/mapped_one.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 40000);
+
+statement ok
+COPY (SELECT i AS c0, i AS c1, i AS c2, i AS c3, i AS c4, i AS c5, i AS c6, i AS c7
+      FROM range(40000) t(i))
+TO '__TEST_DIR__/mapped_all.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 40000);
+
+statement ok
+COPY (SELECT i AS c0, i AS c1, i AS c2, i AS c3, i AS c4, i AS c5, i AS c6, i AS c7
+      FROM range(40000) t(i))
+TO '__TEST_DIR__/mapped_cached.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 40000);
+
+statement ok
+CALL enable_logging('FileSystem');
+
+query II
+SELECT count(*), sum(c7) FROM read_arrow('__TEST_DIR__/mapped_one.arrow');
+----
+40000	799980000
+
+query I
+SELECT sum(bytes) BETWEEN 320000 AND 500000 FROM duckdb_logs_parsed('FileSystem')
+WHERE op = 'READ' AND path LIKE '%mapped_one.arrow%';
+----
+true
+
+query I
+SELECT sum(c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7) FROM read_arrow('__TEST_DIR__/mapped_all.arrow');
+----
+6399840000
+
+query I
+SELECT sum(bytes) > 2560000 FROM duckdb_logs_parsed('FileSystem')
+WHERE op = 'READ' AND path LIKE '%mapped_all.arrow%';
+----
+true
+
+statement ok
+SET cache_local_files = true;
+
+query II
+SELECT count(*), sum(c3) FROM read_arrow('__TEST_DIR__/mapped_cached.arrow');
+----
+40000	799980000
+
+statement ok
+RESET cache_local_files;
+
+statement ok
+CALL disable_logging();
+
+foreach compression lz4 zstd
+
+statement ok
+COPY (SELECT hash(i) AS h, hash(i + 200000) AS g, i FROM range(200000) t(i))
+TO '__TEST_DIR__/mapped_${compression}.arrow' (FORMAT ARROW, COMPRESSION '${compression}', ROW_GROUP_SIZE 50000);
+
+query I
+SELECT size >= 2097152 FROM read_blob('__TEST_DIR__/mapped_${compression}.arrow');
+----
+true
+
+query I
+SELECT count(*) FROM read_arrow('__TEST_DIR__/mapped_${compression}.arrow');
+----
+200000
+
+query I
+SELECT count(*) FROM (
+  FROM read_arrow('__TEST_DIR__/mapped_${compression}.arrow')
+  EXCEPT ALL
+  SELECT hash(i) AS h, hash(i + 200000) AS g, i FROM range(200000) t(i));
+----
+0
+
+endloop
+
+statement ok
+COPY (SELECT range AS i, repeat('a', 100) AS p FROM range(100000))
+TO '__TEST_DIR__/mapped_batch.arrow' (FORMAT ARROW, ROW_GROUP_SIZE 100000);
+
+statement ok
+SET memory_limit = '8MB';
+
+query III
+SELECT count(*), sum(i), min(p) = max(p) FROM read_arrow('__TEST_DIR__/mapped_batch.arrow');
+----
+100000	4999950000	true
+
+statement ok
+RESET memory_limit;

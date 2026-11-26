@@ -68,6 +68,7 @@ class FileIPCStreamFactory final : public ArrowIPCStreamFactory {
   FileSystem& fs;
   TaskScheduler& scheduler;
   OpenFileInfo file;
+  shared_ptr<MemoryMappedFile> mapping;
 };
 }  // namespace ext_nanoarrow
 }  // namespace duckdb

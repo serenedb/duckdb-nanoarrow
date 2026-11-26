@@ -86,7 +86,8 @@ void FileIPCStreamFactory::InitReader() {
 
 unique_ptr<IPCFileStreamReader> FileIPCStreamFactory::OpenReader() const {
   unique_ptr<FileHandle> handle = fs.OpenFile(file, FileOpenFlags::FILE_FLAGS_READ);
-  return make_uniq<IPCFileStreamReader>(fs, std::move(handle), allocator, &scheduler);
+  return make_uniq<IPCFileStreamReader>(fs, std::move(handle), allocator, &scheduler,
+                                        mapping);
 }
 
 }  // namespace ext_nanoarrow
