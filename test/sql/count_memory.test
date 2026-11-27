@@ -16,8 +16,28 @@ COPY t TO '{DATA_PATH}/one_batch.arrow' (FORMAT arrow, CHUNK_SIZE 100000);
 statement ok
 COPY t TO '{DATA_PATH}/one_batch.arrows' (FORMAT arrows, CHUNK_SIZE 100000);
 
+# One compressed record batch of 26 MB of text in each format, counted from the uncompressed lengths its buffers record
+statement ok
+CREATE TABLE r AS SELECT md5(range::VARCHAR) || md5((range + 1)::VARCHAR) AS p FROM range(400000);
+
+statement ok
+COPY r TO '{DATA_PATH}/zstd_batch.arrow' (FORMAT arrow, COMPRESSION zstd, CHUNK_SIZE 400000);
+
+statement ok
+COPY r TO '{DATA_PATH}/lz4_batch.arrows' (FORMAT arrows, COMPRESSION lz4, CHUNK_SIZE 400000);
+
 statement ok
 SET memory_limit='8MB';
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/zstd_batch.arrow');
+----
+400000
+
+query I
+SELECT count(*) FROM read_arrow('{DATA_PATH}/lz4_batch.arrows');
+----
+400000
 
 query I
 SELECT count(*) FROM read_arrow('{DATA_PATH}/one_batch.arrow');

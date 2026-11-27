@@ -33,6 +33,18 @@ SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/bad_body_lz4.a
 ----
 Failed to decompress an Arrow IPC buffer with lz4
 
+# A count checks the batch length against the recorded uncompressed lengths and never runs
+# the codec, so zstd frames the codec rejects still count while their values fail to read
+query I
+SELECT count(*) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/garbage_frames_zstd.arrow');
+----
+1000
+
+statement error
+SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/garbage_frames_zstd.arrow');
+----
+Failed to decompress an Arrow IPC buffer with zstd
+
 # A record batch header must not claim more rows than its buffers hold, compressed or not
 foreach file bad_field_length.arrows bad_field_length.arrow bad_field_length_zstd.arrows bad_field_length_zstd.arrow
 

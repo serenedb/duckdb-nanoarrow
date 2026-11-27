@@ -109,6 +109,15 @@ ArrowErrorCode BlockDecompressWait(ArrowIpcDecompressor*, int64_t, ArrowError*) 
   return NANOARROW_OK;
 }
 
+ArrowErrorCode SizesOnlyDecompressAdd(ArrowIpcDecompressor*, ArrowIpcCompressionType,
+                                      ArrowBufferView, uint8_t*, int64_t, ArrowError*) {
+  return NANOARROW_OK;
+}
+
+void SizesOnlyDecompressRelease(ArrowIpcDecompressor* decompressor) {
+  decompressor->release = nullptr;
+}
+
 void BlockDecompressRelease(ArrowIpcDecompressor* decompressor) {
   delete static_cast<BlockDecompressor*>(decompressor->private_data);
   decompressor->release = nullptr;
@@ -229,6 +238,15 @@ nanoarrow::ipc::UniqueDecoder NewDuckDBArrowDecoder() {
   decompressor.private_data = new BlockDecompressor();
   NANOARROW_THROW_NOT_OK(ArrowIpcDecoderSetDecompressor(decoder.get(), &decompressor));
   return decoder;
+}
+
+void SetArrowIpcDecoderSizesOnly(ArrowIpcDecoder& decoder) {
+  ArrowIpcDecompressor decompressor;
+  decompressor.decompress_add = SizesOnlyDecompressAdd;
+  decompressor.decompress_wait = BlockDecompressWait;
+  decompressor.release = SizesOnlyDecompressRelease;
+  decompressor.private_data = nullptr;
+  NANOARROW_THROW_NOT_OK(ArrowIpcDecoderSetDecompressor(&decoder, &decompressor));
 }
 
 void SetArrowIpcEncoderCompression(ArrowIpcEncoder& encoder,

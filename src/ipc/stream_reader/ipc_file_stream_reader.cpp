@@ -5,6 +5,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/memory_mapped_file.hpp"
 #include "duckdb/formats/row_input.hpp"
+#include "ipc/codecs.hpp"
 #include "ipc/file_format.hpp"
 
 namespace duckdb {
@@ -611,7 +612,11 @@ void IPCFileStreamReader::CountOnly() {
   if (count_field < 0 && !CanCountWithoutBodies()) {
     throw InternalException("NextBatchLength needs a field without dictionaries");
   }
-  skip_bodies = true;
+  if (!skip_bodies) {
+    // The view of a compressed body is only validated, so its sizes are all it needs
+    SetArrowIpcDecoderSizesOnly(*decoder.get());
+    skip_bodies = true;
+  }
 }
 
 bool IPCFileStreamReader::NextBatchLength(idx_t& length) {
@@ -846,7 +851,10 @@ ArrowIpcMessageType IPCFileStreamReader::DecodeFetchedBlock(
       const auto body_start =
           static_cast<idx_t>(block.offset) + static_cast<idx_t>(block.metadata_length);
       if (mapping) {
-        ReadInPlace(body_start, body_size);
+        // Counting reads only the recorded lengths of a compressed body's buffers
+        if (NeedsEndianSwap()) {
+          ReadInPlace(body_start, body_size);
+        }
         message_body = MappedOwner(body_start, body_start + body_size);
         cur_ptr = mapping->GetData(body_start, body_size);
       } else {
