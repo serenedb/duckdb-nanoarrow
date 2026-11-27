@@ -27,6 +27,11 @@ SELECT count(*) FROM arrow_kv_metadata('data/arrow_js.arrow');
 ----
 0
 
+statement error
+SELECT * FROM read_arrow('data/polars_views.arrow');
+----
+The Arrow IPC file's footer cannot be read: Utf8View not yet supported in IPC reader
+
 # The schema message of this file names the columns the other way round
 query II
 SELECT AAAA, BBBB FROM read_arrow('data/corrupt/footer_names_swapped.arrow');

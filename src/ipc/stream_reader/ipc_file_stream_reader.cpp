@@ -259,16 +259,22 @@ bool IPCFileStreamReader::TryReadFooter() {
 bool IPCFileStreamReader::DecodeFooter(ArrowIpcDecoder& footer_decoder,
                                        ArrowBufferView window) {
   ArrowError footer_error{};
-  return ArrowIpcDecoderPeekFooter(
-             &footer_decoder,
-             AllocatedDataView(
-                 window.data.as_uint8 + window.size_bytes - kArrowIPCFileFooterTailSize,
-                 kArrowIPCFileFooterTailSize),
-             &footer_error) == NANOARROW_OK &&
-         ArrowIpcDecoderVerifyFooter(&footer_decoder, window, &footer_error) ==
-             NANOARROW_OK &&
-         ArrowIpcDecoderDecodeFooter(&footer_decoder, window, &footer_error) ==
-             NANOARROW_OK;
+  if (ArrowIpcDecoderPeekFooter(
+          &footer_decoder,
+          AllocatedDataView(
+              window.data.as_uint8 + window.size_bytes - kArrowIPCFileFooterTailSize,
+              kArrowIPCFileFooterTailSize),
+          &footer_error) != NANOARROW_OK ||
+      ArrowIpcDecoderVerifyFooter(&footer_decoder, window, &footer_error) !=
+          NANOARROW_OK) {
+    return false;
+  }
+  const auto status = ArrowIpcDecoderDecodeFooter(&footer_decoder, window, &footer_error);
+  if (status == ENOTSUP) {
+    throw IOException("The Arrow IPC file's footer cannot be read: %s",
+                      string(footer_error.message));
+  }
+  return status == NANOARROW_OK;
 }
 
 ArrowBufferView IPCFileStreamReader::FooterWindow() const {
