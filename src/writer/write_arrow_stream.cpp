@@ -224,17 +224,6 @@ unique_ptr<LocalFunctionData> ArrowWriteInitializeLocal(ExecutionContext& contex
   return make_uniq<LocalFunctionData>();
 }
 
-CopyFunctionExecutionMode ArrowWriteExecutionMode(bool preserve_insertion_order,
-                                                  bool supports_batch_index) {
-  if (!preserve_insertion_order) {
-    return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
-  }
-  if (supports_batch_index) {
-    return CopyFunctionExecutionMode::BATCH_COPY_TO_FILE;
-  }
-  return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
-}
-
 optional_idx ArrowWriteDesiredBatchSize(ClientContext& context,
                                         FunctionData& bind_data_p) {
   auto& bind_data = bind_data_p.Cast<ArrowWriteBindData>();
@@ -285,7 +274,7 @@ void RegisterArrowStreamCopyFunction(ExtensionLoader& loader) {
   function.copy_to_initialize_local = ArrowWriteInitializeLocal;
   function.copy_to_finalize = ArrowWriteFinalize;
   function.copy_to_get_written_statistics = ArrowWriteGetWrittenStatistics;
-  function.execution_mode = ArrowWriteExecutionMode;
+  function.execution_mode = CopyFunction::ParallelUnlessOrdered;
   function.copy_from_bind = MultiFileFunction<ArrowMultiFileInfo>::MultiFileBindCopy;
   function.copy_from_function = ReadArrowStreamFunction();
   function.prepare_batch = ArrowWritePrepareBatch;
