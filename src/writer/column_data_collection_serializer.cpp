@@ -100,8 +100,14 @@ void ColumnDataCollectionSerializer::Init(const ArrowSchema* schema,
   THROW_NOT_OK(InternalException, &error,
                ArrowArrayViewInitFromSchema(chunk_view.get(), schema, &error));
 
+  types = logical_types;
   extension_types =
       ArrowTypeExtensionData::GetExtensionTypes(*options.client_context, logical_types);
+}
+
+unique_ptr<ArrowAppender> ColumnDataCollectionSerializer::NewAppender(
+    idx_t capacity) const {
+  return make_uniq<ArrowAppender>(types, capacity, options, extension_types);
 }
 
 void ColumnDataCollectionSerializer::SerializeSchema(const ArrowSchema* schema,
@@ -194,11 +200,11 @@ idx_t ColumnDataCollectionSerializer::Serialize(const ColumnDataCollection& buff
   if (buffer.Count() == 0) {
     return 0;
   }
-  ArrowAppender appender(buffer.Types(), buffer.Count(), options, extension_types);
+  auto appender = NewAppender(buffer.Count());
   for (auto& chunk : buffer.Chunks()) {
-    appender.Append(chunk, 0, chunk.size(), chunk.size());
+    appender->Append(chunk, 0, chunk.size(), chunk.size());
   }
-  return Serialize(appender);
+  return Serialize(*appender);
 }
 
 namespace {

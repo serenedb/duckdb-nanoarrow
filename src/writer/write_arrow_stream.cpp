@@ -1,6 +1,7 @@
 
 #include "write_arrow_stream.hpp"
 
+#include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
 #include "file_scanner/arrow_multi_file_info.hpp"
 
@@ -36,6 +37,8 @@ struct ArrowWriteBindData : public TableFunctionData {
 
 struct ArrowWriteGlobalState : public GlobalFunctionData {
   unique_ptr<ArrowStreamWriter> writer;
+  mutex combine_lock;
+  unique_ptr<ColumnDataCollection> combine_buffer;
 };
 
 // Reads the entries of a STRUCT option value as key/value pairs, blobs as raw bytes
@@ -205,9 +208,22 @@ unique_ptr<GlobalFunctionData> ArrowWriteInitializeGlobal(ClientContext& context
   return std::move(global_state);
 }
 
+void ArrowWriteFlushCollection(ArrowWriteGlobalState& global_state,
+                               ColumnDataCollectionSerializer& serializer,
+                               const ColumnDataCollection& collection) {
+  if (serializer.Serialize(collection)) {
+    global_state.writer->Flush(serializer);
+  }
+}
+
 void ArrowWriteFinalize(ClientContext& context, FunctionData& bind_data,
                         GlobalFunctionData& gstate) {
   auto& global_state = gstate.Cast<ArrowWriteGlobalState>();
+  if (global_state.combine_buffer) {
+    ArrowWriteFlushCollection(global_state, *global_state.writer->NewSerializer(),
+                              *global_state.combine_buffer);
+    global_state.combine_buffer.reset();
+  }
   global_state.writer->Finalize();
 }
 
@@ -218,10 +234,97 @@ void ArrowWriteGetWrittenStatistics(ClientContext& context, FunctionData& bind_d
   global_state.writer->SetWrittenStatistics(statistics);
 }
 
-// Batch copies still ask for a local state, which prepare_batch and flush_batch never use
+struct ArrowWriteLocalState : public LocalFunctionData {
+  unique_ptr<ColumnDataCollectionSerializer> serializer;
+  unique_ptr<ColumnDataCollection> buffer;
+  ColumnDataAppendState append_state;
+  unique_ptr<ArrowAppender> appender;
+};
+
 unique_ptr<LocalFunctionData> ArrowWriteInitializeLocal(ExecutionContext& context,
                                                         FunctionData& bind_data_p) {
-  return make_uniq<LocalFunctionData>();
+  return make_uniq<ArrowWriteLocalState>();
+}
+
+idx_t ArrowWriteBatchRows(const ArrowWriteBindData& bind_data) {
+  return MaxValue<idx_t>(bind_data.row_group_size, 1);
+}
+
+void ArrowWriteFlushAppender(ArrowWriteGlobalState& global_state,
+                             ArrowWriteLocalState& local_state) {
+  local_state.serializer->Serialize(*local_state.appender);
+  local_state.appender.reset();
+  global_state.writer->Flush(*local_state.serializer);
+}
+
+void ArrowWriteAppend(ArrowWriteGlobalState& global_state,
+                      ArrowWriteLocalState& local_state, DataChunk& input,
+                      idx_t batch_rows) {
+  for (idx_t offset = 0; offset < input.size();) {
+    if (!local_state.appender) {
+      local_state.appender = local_state.serializer->NewAppender(batch_rows);
+    }
+    const auto rows = MinValue<idx_t>(input.size() - offset,
+                                      batch_rows - local_state.appender->RowCount());
+    local_state.appender->Append(input, offset, offset + rows, input.size());
+    offset += rows;
+    if (local_state.appender->RowCount() == batch_rows) {
+      ArrowWriteFlushAppender(global_state, local_state);
+    }
+  }
+}
+
+void ArrowWriteSink(ExecutionContext& context, FunctionData& bind_data_p,
+                    GlobalFunctionData& gstate, LocalFunctionData& lstate,
+                    DataChunk& input) {
+  auto& global_state = gstate.Cast<ArrowWriteGlobalState>();
+  auto& local_state = lstate.Cast<ArrowWriteLocalState>();
+  const auto batch_rows = ArrowWriteBatchRows(bind_data_p.Cast<ArrowWriteBindData>());
+  if (!local_state.serializer) {
+    local_state.serializer = global_state.writer->NewSerializer();
+    local_state.buffer =
+        make_uniq<ColumnDataCollection>(context.client, input.GetTypes());
+    local_state.buffer->InitializeAppend(local_state.append_state);
+  }
+  if (!local_state.buffer) {
+    ArrowWriteAppend(global_state, local_state, input, batch_rows);
+    return;
+  }
+  local_state.buffer->Append(local_state.append_state, input);
+  if (local_state.buffer->Count() < MaxValue<idx_t>(batch_rows / 8, 1)) {
+    return;
+  }
+  local_state.append_state.current_chunk_state.handles.clear();
+  const auto buffer = std::move(local_state.buffer);
+  for (auto& chunk : buffer->Chunks()) {
+    ArrowWriteAppend(global_state, local_state, chunk, batch_rows);
+  }
+}
+
+void ArrowWriteCombine(ExecutionContext& context, FunctionData& bind_data_p,
+                       GlobalFunctionData& gstate, LocalFunctionData& lstate) {
+  auto& global_state = gstate.Cast<ArrowWriteGlobalState>();
+  auto& local_state = lstate.Cast<ArrowWriteLocalState>();
+  if (local_state.appender) {
+    ArrowWriteFlushAppender(global_state, local_state);
+  }
+  if (!local_state.buffer) {
+    return;
+  }
+  local_state.append_state.current_chunk_state.handles.clear();
+  unique_lock<mutex> guard(global_state.combine_lock);
+  if (global_state.combine_buffer) {
+    global_state.combine_buffer->Combine(*local_state.buffer);
+  } else {
+    global_state.combine_buffer = std::move(local_state.buffer);
+  }
+  const auto batch_rows = ArrowWriteBatchRows(bind_data_p.Cast<ArrowWriteBindData>());
+  if (global_state.combine_buffer->Count() < batch_rows / 2) {
+    return;
+  }
+  const auto combined = std::move(global_state.combine_buffer);
+  guard.unlock();
+  ArrowWriteFlushCollection(global_state, *local_state.serializer, *combined);
 }
 
 optional_idx ArrowWriteDesiredBatchSize(ClientContext& context,
@@ -272,6 +375,9 @@ void RegisterArrowStreamCopyFunction(ExtensionLoader& loader) {
   function.copy_to_bind = ArrowWriteBind;
   function.copy_to_initialize_global = ArrowWriteInitializeGlobal;
   function.copy_to_initialize_local = ArrowWriteInitializeLocal;
+  function.copy_to_sink = ArrowWriteSink;
+  function.copy_to_combine = ArrowWriteCombine;
+  function.parallel_sink = true;
   function.copy_to_finalize = ArrowWriteFinalize;
   function.copy_to_get_written_statistics = ArrowWriteGetWrittenStatistics;
   function.execution_mode = CopyFunction::ParallelUnlessOrdered;

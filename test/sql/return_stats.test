@@ -81,3 +81,41 @@ query IIIIIIII
 SELECT count, file_size_bytes, footer_size_bytes, extra_info['record_batch_count']::UBIGINT, extra_info['total_compressed_size']::UBIGINT, extra_info['peak_read_memory_bytes']::UBIGINT, extra_info['schema_size_bytes']::UBIGINT, file_size_bytes - footer_size_bytes - 26 - extra_info['schema_size_bytes']::UBIGINT FROM range_stats
 ----
 5000	40874	240	3	40000	66363	152	40456
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+CREATE TABLE union_stats AS WITH s AS (COPY (SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000) UNION ALL SELECT * FROM range(10000)) TO '{DATA_PATH}/union_stats.arrow' (FORMAT ARROW, RETURN_STATS)) SELECT * FROM s
+
+query II
+SELECT count, extra_info['record_batch_count']::UBIGINT FROM union_stats
+----
+80000	2
+
+query II
+SELECT count(*), sum(range) FROM read_arrow('{DATA_PATH}/union_stats.arrow')
+----
+80000	399960000
+
+statement ok
+SET threads = 1
+
+statement ok
+CREATE TABLE direct_stats AS WITH s AS (COPY (SELECT * FROM range(300000)) TO '{DATA_PATH}/direct_stats.arrow' (FORMAT ARROW, CHUNK_SIZE 100000, RETURN_STATS)) SELECT * FROM s
+
+query II
+SELECT count, extra_info['record_batch_count']::UBIGINT FROM direct_stats
+----
+300000	3
+
+query II
+SELECT count(*), sum(range) FROM read_arrow('{DATA_PATH}/direct_stats.arrow')
+----
+300000	44999850000
+
+statement ok
+RESET threads
+
+statement ok
+RESET preserve_insertion_order

@@ -37,6 +37,8 @@ class ColumnDataCollectionSerializer {
   void SerializeFooter(nanoarrow::UniqueSchema schema,
                        const vector<ArrowIpcFileBlock>& blocks);
 
+  unique_ptr<ArrowAppender> NewAppender(idx_t capacity) const;
+
   idx_t Serialize(ArrowAppender& appender);
 
   idx_t Serialize(const ColumnDataCollection& buffer);
@@ -59,6 +61,7 @@ class ColumnDataCollectionSerializer {
   ArrowIpcCompressionOptions compression;
   bool track_body_size;
   ArrowBatchMeasure batch_measure{};
+  vector<LogicalType> types;
   unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;
   nanoarrow::ipc::UniqueEncoder encoder;
   nanoarrow::UniqueArrayView chunk_view;
