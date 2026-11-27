@@ -6,7 +6,11 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/formats/block_codecs.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 #include "nanoarrow_errors.hpp"
+
+#include <mutex>
 
 namespace duckdb {
 namespace ext_nanoarrow {
@@ -110,16 +114,86 @@ void BlockDecompressRelease(ArrowIpcDecompressor* decompressor) {
   decompressor->release = nullptr;
 }
 
+constexpr idx_t kParallelCompressBytes = 256 * 1024;
+
+class ParallelBlockCompressor {
+ public:
+  ParallelBlockCompressor(optional_ptr<ClientContext> context, BlockCodec codec,
+                          int level)
+      : context(context), codec(codec), level(level), local(codec, level) {}
+
+  ~ParallelBlockCompressor() {
+    if (executor) {
+      executor->Join();
+    }
+  }
+
+  void Add(ArrowBufferView src, ArrowBuffer* dst) {
+    const auto size = NumericCast<idx_t>(src.size_bytes);
+    const auto bound = local.MaxCompressedSize(size);
+    NANOARROW_THROW_NOT_OK(ArrowBufferReserve(dst, NumericCast<int64_t>(bound)));
+    if (!context || size < kParallelCompressBytes) {
+      Compress(local, src, dst, bound);
+      return;
+    }
+    if (!executor) {
+      executor = make_uniq<TaskExecutor>(*context);
+    }
+    executor->ScheduleTask(
+        [this, src, dst, bound]() {
+          auto compressor = Take();
+          Compress(*compressor, src, dst, bound);
+          Return(std::move(compressor));
+        },
+        "ArrowCompressTask");
+  }
+
+  void Wait() {
+    if (!executor) {
+      return;
+    }
+    auto running = std::move(executor);
+    running->WorkOnTasks();
+  }
+
+ private:
+  static void Compress(BlockCompressor& compressor, ArrowBufferView src, ArrowBuffer* dst,
+                       idx_t bound) {
+    dst->size_bytes += NumericCast<int64_t>(
+        compressor.Compress(src.data.as_uint8, NumericCast<idx_t>(src.size_bytes),
+                            dst->data + dst->size_bytes, bound));
+  }
+
+  unique_ptr<BlockCompressor> Take() {
+    {
+      lock_guard<mutex> guard(lock);
+      if (!idle.empty()) {
+        auto compressor = std::move(idle.back());
+        idle.pop_back();
+        return compressor;
+      }
+    }
+    return make_uniq<BlockCompressor>(codec, level);
+  }
+
+  void Return(unique_ptr<BlockCompressor> compressor) {
+    lock_guard<mutex> guard(lock);
+    idle.push_back(std::move(compressor));
+  }
+
+  optional_ptr<ClientContext> context;
+  const BlockCodec codec;
+  const int level;
+  BlockCompressor local;
+  unique_ptr<TaskExecutor> executor;
+  mutex lock;
+  vector<unique_ptr<BlockCompressor>> idle;
+};
+
 ArrowErrorCode BlockCompressAdd(ArrowIpcCompressor* compressor, ArrowBufferView src,
                                 ArrowBuffer* dst, ArrowError* error) {
   try {
-    auto& block = *static_cast<BlockCompressor*>(compressor->private_data);
-    const auto size = NumericCast<idx_t>(src.size_bytes);
-    const auto bound = block.MaxCompressedSize(size);
-    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
-        ArrowBufferReserve(dst, NumericCast<int64_t>(bound)), error);
-    dst->size_bytes += NumericCast<int64_t>(
-        block.Compress(src.data.as_uint8, size, dst->data + dst->size_bytes, bound));
+    static_cast<ParallelBlockCompressor*>(compressor->private_data)->Add(src, dst);
     return NANOARROW_OK;
   } catch (std::exception& ex) {
     ArrowErrorSet(error, "%s", ErrorData(ex).RawMessage().c_str());
@@ -127,12 +201,19 @@ ArrowErrorCode BlockCompressAdd(ArrowIpcCompressor* compressor, ArrowBufferView 
   }
 }
 
-ArrowErrorCode BlockCompressWait(ArrowIpcCompressor*, int64_t, ArrowError*) {
-  return NANOARROW_OK;
+ArrowErrorCode BlockCompressWait(ArrowIpcCompressor* compressor, int64_t,
+                                 ArrowError* error) {
+  try {
+    static_cast<ParallelBlockCompressor*>(compressor->private_data)->Wait();
+    return NANOARROW_OK;
+  } catch (std::exception& ex) {
+    ArrowErrorSet(error, "%s", ErrorData(ex).RawMessage().c_str());
+    return EIO;
+  }
 }
 
 void BlockCompressRelease(ArrowIpcCompressor* compressor) {
-  delete static_cast<BlockCompressor*>(compressor->private_data);
+  delete static_cast<ParallelBlockCompressor*>(compressor->private_data);
   compressor->release = nullptr;
 }
 
@@ -151,7 +232,8 @@ nanoarrow::ipc::UniqueDecoder NewDuckDBArrowDecoder() {
 }
 
 void SetArrowIpcEncoderCompression(ArrowIpcEncoder& encoder,
-                                   const ArrowIpcCompressionOptions& options) {
+                                   const ArrowIpcCompressionOptions& options,
+                                   optional_ptr<ClientContext> context) {
   BlockCodec codec;
   if (!TryGetBlockCodec(options.type, codec)) {
     return;
@@ -162,8 +244,9 @@ void SetArrowIpcEncoderCompression(ArrowIpcEncoder& encoder,
   compressor.compress_wait = BlockCompressWait;
   compressor.release = BlockCompressRelease;
   compressor.private_data =
-      new BlockCompressor(codec, options.level_set ? NumericCast<int>(options.level)
-                                                   : BlockCompressor::DEFAULT_LEVEL);
+      new ParallelBlockCompressor(context, codec,
+                                  options.level_set ? NumericCast<int>(options.level)
+                                                    : BlockCompressor::DEFAULT_LEVEL);
   NANOARROW_THROW_NOT_OK(ArrowIpcEncoderSetCompressor(&encoder, &compressor));
 }
 

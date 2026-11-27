@@ -43,6 +43,28 @@ SELECT count(*) FROM read_arrow('{DATA_PATH}/test_${compression}.arrow');
 
 endloop
 
+statement ok
+CREATE TABLE wide AS
+SELECT i, concat('row ', i) AS s, CASE WHEN i % 13 = 0 THEN NULL ELSE i * 1.5 END AS d
+FROM range(300000) t(i);
+
+foreach compression zstd lz4
+
+statement ok
+COPY wide TO '{DATA_PATH}/wide_${compression}.arrow' (FORMAT ARROW, COMPRESSION '${compression}');
+
+query I
+SELECT count(*) FROM (SELECT * FROM wide EXCEPT ALL SELECT * FROM read_arrow('{DATA_PATH}/wide_${compression}.arrow'));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_arrow('{DATA_PATH}/wide_${compression}.arrow') EXCEPT ALL SELECT * FROM wide);
+----
+0
+
+endloop
+
 # Compressed files are smaller than the uncompressed one
 query I
 SELECT (SELECT size FROM read_blob('{DATA_PATH}/test_zstd.arrows')) < (SELECT size FROM read_blob('{DATA_PATH}/test_uncompressed.arrows'));

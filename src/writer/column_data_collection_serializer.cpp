@@ -96,7 +96,7 @@ void ColumnDataCollectionSerializer::Init(const ArrowSchema* schema,
   InitArrowDuckBuffer(header.get(), allocator);
   InitArrowDuckBuffer(body.get(), allocator);
   NANOARROW_THROW_NOT_OK(ArrowIpcEncoderInit(encoder.get()));
-  SetArrowIpcEncoderCompression(*encoder.get(), compression);
+  SetArrowIpcEncoderCompression(*encoder.get(), compression, options.client_context);
   THROW_NOT_OK(InternalException, &error,
                ArrowArrayViewInitFromSchema(chunk_view.get(), schema, &error));
 

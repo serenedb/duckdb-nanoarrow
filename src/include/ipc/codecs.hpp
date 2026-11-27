@@ -9,10 +9,13 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "nanoarrow/nanoarrow_ipc.hpp"
 
 namespace duckdb {
+
+class ClientContext;
 namespace ext_nanoarrow {
 
 //! How the bodies of RecordBatch messages are compressed when writing Arrow IPC
@@ -33,7 +36,8 @@ nanoarrow::ipc::UniqueDecoder NewDuckDBArrowDecoder();
 
 //! Makes an IPC encoder compress bodies, throws if this nanoarrow build lacks the codec
 void SetArrowIpcEncoderCompression(ArrowIpcEncoder& encoder,
-                                   const ArrowIpcCompressionOptions& options);
+                                   const ArrowIpcCompressionOptions& options,
+                                   optional_ptr<ClientContext> context);
 
 }  // namespace ext_nanoarrow
 }  // namespace duckdb
