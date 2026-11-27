@@ -26,12 +26,12 @@ endloop
 statement error
 SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/bad_body_zstd.arrows');
 ----
-ZSTD_decompress
+Failed to decompress an Arrow IPC buffer with zstd
 
 statement error
 SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/bad_body_lz4.arrows');
 ----
-LZ4 frame
+Failed to decompress an Arrow IPC buffer with lz4
 
 # A record batch header must not claim more rows than its buffers hold, compressed or not
 foreach file bad_field_length.arrows bad_field_length.arrow bad_field_length_zstd.arrows bad_field_length_zstd.arrow

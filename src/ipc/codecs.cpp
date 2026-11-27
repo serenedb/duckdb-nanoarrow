@@ -1,8 +1,11 @@
 #include "ipc/codecs.hpp"
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/formats/block_codecs.hpp"
 #include "nanoarrow_errors.hpp"
 
 namespace duckdb {
@@ -59,20 +62,109 @@ void ArrowIpcCompressionOptions::Validate() const {
   }
 }
 
+namespace {
+
+bool TryGetBlockCodec(ArrowIpcCompressionType type, BlockCodec& codec) {
+  switch (type) {
+    case NANOARROW_IPC_COMPRESSION_TYPE_ZSTD:
+      codec = BlockCodec::ZSTD;
+      return true;
+    case NANOARROW_IPC_COMPRESSION_TYPE_LZ4_FRAME:
+      codec = BlockCodec::LZ4_FRAME;
+      return true;
+    default:
+      return false;
+  }
+}
+
+ArrowErrorCode BlockDecompressAdd(ArrowIpcDecompressor* decompressor,
+                                  ArrowIpcCompressionType type, ArrowBufferView src,
+                                  uint8_t* dst, int64_t dst_size, ArrowError* error) {
+  BlockCodec codec;
+  if (!TryGetBlockCodec(type, codec)) {
+    ArrowErrorSet(error, "Arrow IPC compression %s is not supported",
+                  ArrowIpcCompressionTypeToString(type));
+    return ENOTSUP;
+  }
+  try {
+    auto& block = *static_cast<BlockDecompressor*>(decompressor->private_data);
+    string message;
+    if (block.TryDecompress(codec, src.data.as_uint8, NumericCast<idx_t>(src.size_bytes),
+                            dst, NumericCast<idx_t>(dst_size), message)) {
+      return NANOARROW_OK;
+    }
+    ArrowErrorSet(error, "Failed to decompress an Arrow IPC buffer with %s: %s",
+                  ArrowIpcCompressionTypeToString(type), message.c_str());
+  } catch (std::exception& ex) {
+    ArrowErrorSet(error, "%s", ErrorData(ex).RawMessage().c_str());
+  }
+  return EIO;
+}
+
+ArrowErrorCode BlockDecompressWait(ArrowIpcDecompressor*, int64_t, ArrowError*) {
+  return NANOARROW_OK;
+}
+
+void BlockDecompressRelease(ArrowIpcDecompressor* decompressor) {
+  delete static_cast<BlockDecompressor*>(decompressor->private_data);
+  decompressor->release = nullptr;
+}
+
+ArrowErrorCode BlockCompressAdd(ArrowIpcCompressor* compressor, ArrowBufferView src,
+                                ArrowBuffer* dst, ArrowError* error) {
+  try {
+    auto& block = *static_cast<BlockCompressor*>(compressor->private_data);
+    const auto size = NumericCast<idx_t>(src.size_bytes);
+    const auto bound = block.MaxCompressedSize(size);
+    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
+        ArrowBufferReserve(dst, NumericCast<int64_t>(bound)), error);
+    dst->size_bytes += NumericCast<int64_t>(
+        block.Compress(src.data.as_uint8, size, dst->data + dst->size_bytes, bound));
+    return NANOARROW_OK;
+  } catch (std::exception& ex) {
+    ArrowErrorSet(error, "%s", ErrorData(ex).RawMessage().c_str());
+    return EIO;
+  }
+}
+
+ArrowErrorCode BlockCompressWait(ArrowIpcCompressor*, int64_t, ArrowError*) {
+  return NANOARROW_OK;
+}
+
+void BlockCompressRelease(ArrowIpcCompressor* compressor) {
+  delete static_cast<BlockCompressor*>(compressor->private_data);
+  compressor->release = nullptr;
+}
+
+}  // namespace
+
 nanoarrow::ipc::UniqueDecoder NewDuckDBArrowDecoder() {
-  // nanoarrow adds its serial decompressor on first use, a threaded one could be set here
   nanoarrow::ipc::UniqueDecoder decoder;
   NANOARROW_THROW_NOT_OK(ArrowIpcDecoderInit(decoder.get()));
+  ArrowIpcDecompressor decompressor;
+  decompressor.decompress_add = BlockDecompressAdd;
+  decompressor.decompress_wait = BlockDecompressWait;
+  decompressor.release = BlockDecompressRelease;
+  decompressor.private_data = new BlockDecompressor();
+  NANOARROW_THROW_NOT_OK(ArrowIpcDecoderSetDecompressor(decoder.get(), &decompressor));
   return decoder;
 }
 
 void SetArrowIpcEncoderCompression(ArrowIpcEncoder& encoder,
                                    const ArrowIpcCompressionOptions& options) {
-  // Installs nanoarrow's serial compressor, ArrowIpcEncoderSetCompressor takes others
-  ArrowError error{};
-  THROW_NOT_OK(InternalException, &error,
-               ArrowIpcEncoderSetCompression(&encoder, options.type,
-                                             static_cast<int>(options.level), &error));
+  BlockCodec codec;
+  if (!TryGetBlockCodec(options.type, codec)) {
+    return;
+  }
+  ArrowIpcCompressor compressor;
+  compressor.compression_type = options.type;
+  compressor.compress_add = BlockCompressAdd;
+  compressor.compress_wait = BlockCompressWait;
+  compressor.release = BlockCompressRelease;
+  compressor.private_data =
+      new BlockCompressor(codec, options.level_set ? NumericCast<int>(options.level)
+                                                   : BlockCompressor::DEFAULT_LEVEL);
+  NANOARROW_THROW_NOT_OK(ArrowIpcEncoderSetCompressor(&encoder, &compressor));
 }
 
 }  // namespace ext_nanoarrow
