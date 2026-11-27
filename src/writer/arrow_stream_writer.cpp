@@ -191,7 +191,8 @@ void ArrowStreamWriter::WriteSchema() {
 
 unique_ptr<ColumnDataCollectionSerializer> ArrowStreamWriter::NewSerializer() const {
   auto serializer = make_uniq<ColumnDataCollectionSerializer>(
-      options, allocator, compression, size_metadata || written_stats);
+      options, allocator, compression, size_metadata || written_stats,
+      async_writer != nullptr);
   serializer->Init(schema.get(), logical_types);
   return serializer;
 }

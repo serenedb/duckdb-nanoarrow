@@ -28,7 +28,8 @@ class ColumnDataCollectionSerializer {
  public:
   ColumnDataCollectionSerializer(ClientProperties options, Allocator& allocator,
                                  ArrowIpcCompressionOptions compression = {},
-                                 bool track_body_size = false);
+                                 bool track_body_size = false,
+                                 bool contiguous_body = true);
 
   void Init(const ArrowSchema* schema, const vector<LogicalType>& logical_types);
 
@@ -56,10 +57,26 @@ class ColumnDataCollectionSerializer {
   nanoarrow::UniqueBuffer GetBody();
 
  private:
+  struct BodyPiece {
+    const uint8_t* data;
+    int64_t size;
+    int64_t padded_size;
+  };
+
+  static ArrowErrorCode CollectBodyPiece(ArrowBufferView buffer_view,
+                                         ArrowIpcEncoder* encoder,
+                                         ArrowIpcBufferEncoder* buffer_encoder,
+                                         int64_t* offset, int64_t* length,
+                                         ArrowError* error);
+
   ClientProperties options;
   Allocator& allocator;
   ArrowIpcCompressionOptions compression;
   bool track_body_size;
+  bool contiguous_body;
+  nanoarrow::UniqueArray array;
+  vector<BodyPiece> body_pieces;
+  int64_t body_length = 0;
   ArrowBatchMeasure batch_measure{};
   vector<LogicalType> types;
   unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> extension_types;

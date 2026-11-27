@@ -80,11 +80,12 @@ nanoarrow::UniqueSchema CreateArrowIpcSchema(const vector<LogicalType>& types,
 
 ColumnDataCollectionSerializer::ColumnDataCollectionSerializer(
     ClientProperties options, Allocator& allocator,
-    ArrowIpcCompressionOptions compression, bool track_body_size)
+    ArrowIpcCompressionOptions compression, bool track_body_size, bool contiguous_body)
     : options(std::move(options)),
       allocator(allocator),
       compression(compression),
-      track_body_size(track_body_size) {}
+      track_body_size(track_body_size),
+      contiguous_body(contiguous_body) {}
 
 void ColumnDataCollectionSerializer::Init(const ArrowSchema* schema,
                                           const vector<LogicalType>& logical_types) {
@@ -114,6 +115,7 @@ void ColumnDataCollectionSerializer::SerializeSchema(const ArrowSchema* schema,
                                                      idx_t reserved_size) {
   header->size_bytes = 0;
   body->size_bytes = 0;
+  body_length = 0;
   THROW_NOT_OK(NotImplementedException, &error,
                ArrowIpcEncoderEncodeSchema(encoder.get(), schema, &error));
   NANOARROW_THROW_NOT_OK(
@@ -134,6 +136,7 @@ void ColumnDataCollectionSerializer::SerializeFooter(
     nanoarrow::UniqueSchema schema, const vector<ArrowIpcFileBlock>& blocks) {
   header->size_bytes = 0;
   body->size_bytes = 0;
+  body_length = 0;
   nanoarrow::ipc::UniqueFooter footer;
   ArrowSchemaMove(schema.get(), &footer->schema);
   NANOARROW_THROW_NOT_OK(
@@ -170,11 +173,30 @@ static void DropUnusedValidity(ArrowArrayView& view) {
   }
 }
 
+ArrowErrorCode ColumnDataCollectionSerializer::CollectBodyPiece(
+    ArrowBufferView buffer_view, ArrowIpcEncoder* encoder,
+    ArrowIpcBufferEncoder* buffer_encoder, int64_t* offset, int64_t* length,
+    ArrowError* error) {
+  auto& pieces = *static_cast<vector<BodyPiece>*>(buffer_encoder->encode_buffer_state);
+  const auto padded_size = AlignValue<int64_t>(buffer_view.size_bytes);
+  try {
+    pieces.push_back({buffer_view.data.as_uint8, buffer_view.size_bytes, padded_size});
+  } catch (std::bad_alloc&) {
+    return ENOMEM;
+  }
+  *offset = buffer_encoder->body_length;
+  *length = buffer_view.size_bytes;
+  buffer_encoder->body_length += padded_size;
+  return NANOARROW_OK;
+}
+
 idx_t ColumnDataCollectionSerializer::Serialize(ArrowAppender& appender) {
   ArrowArray finalized = appender.Finalize();
-  nanoarrow::UniqueArray array(&finalized);
+  array.reset();
+  ArrowArrayMove(&finalized, array.get());
   header->size_bytes = 0;
   body->size_bytes = 0;
+  body_pieces.clear();
 
   THROW_NOT_OK(duckdb::InternalException, &error,
                ArrowArrayViewSetArray(chunk_view.get(), array.get(), &error));
@@ -183,14 +205,24 @@ idx_t ColumnDataCollectionSerializer::Serialize(ArrowAppender& appender) {
     // Measured as written: uncompressed buffer sizes, the dropped bitmaps at size 0
     ArrowBatchStatsMeasure(chunk_view.get(), &batch_measure);
   }
-  if (compression.type == NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
-    // One exact allocation, where growing buffer by buffer doubles and keeps the peaks
-    NANOARROW_THROW_NOT_OK(
-        ArrowBufferReserve(body.get(), PaddedBodySize(*chunk_view.get())));
+  if (contiguous_body) {
+    if (compression.type == NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
+      // One exact allocation, where growing buffer by buffer doubles and keeps the peaks
+      NANOARROW_THROW_NOT_OK(
+          ArrowBufferReserve(body.get(), PaddedBodySize(*chunk_view.get())));
+    }
+    THROW_NOT_OK(InternalException, &error,
+                 ArrowIpcEncoderEncodeSimpleRecordBatch(encoder.get(), chunk_view.get(),
+                                                        body.get(), &error));
+    body_length = body->size_bytes;
+    array.reset();
+  } else {
+    ArrowIpcBufferEncoder buffer_encoder{&CollectBodyPiece, &body_pieces, 0};
+    THROW_NOT_OK(InternalException, &error,
+                 ArrowIpcEncoderEncodeRecordBatch(encoder.get(), &buffer_encoder,
+                                                  chunk_view.get(), &error));
+    body_length = buffer_encoder.body_length;
   }
-  THROW_NOT_OK(InternalException, &error,
-               ArrowIpcEncoderEncodeSimpleRecordBatch(encoder.get(), chunk_view.get(),
-                                                      body.get(), &error));
   NANOARROW_THROW_NOT_OK(
       ArrowIpcEncoderFinalizeBuffer(encoder.get(), true, header.get()));
 
@@ -253,9 +285,21 @@ ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(AsyncFileWriter& writer)
 
 ArrowIpcFileBlock ColumnDataCollectionSerializer::Flush(BufferedFileWriter& writer) {
   ArrowIpcFileBlock block{NumericCast<int64_t>(writer.GetTotalWritten()),
-                          NumericCast<int32_t>(header->size_bytes), body->size_bytes};
+                          NumericCast<int32_t>(header->size_bytes), body_length};
   writer.WriteData(header->data, header->size_bytes);
-  writer.WriteData(body->data, body->size_bytes);
+  if (contiguous_body) {
+    writer.WriteData(body->data, body->size_bytes);
+    return block;
+  }
+  static constexpr uint8_t padding[8] = {};
+  for (const auto& piece : body_pieces) {
+    if (piece.size > 0) {
+      writer.WriteData(piece.data, NumericCast<idx_t>(piece.size));
+    }
+    writer.WriteData(padding, NumericCast<idx_t>(piece.padded_size - piece.size));
+  }
+  body_pieces.clear();
+  array.reset();
   return block;
 }
 nanoarrow::UniqueBuffer ColumnDataCollectionSerializer::GetHeader() {
