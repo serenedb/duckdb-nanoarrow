@@ -207,7 +207,6 @@ idx_t ColumnDataCollectionSerializer::Serialize(ArrowAppender& appender) {
   }
   if (contiguous_body) {
     if (compression.type == NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
-      // One exact allocation, where growing buffer by buffer doubles and keeps the peaks
       NANOARROW_THROW_NOT_OK(
           ArrowBufferReserve(body.get(), PaddedBodySize(*chunk_view.get())));
     }
