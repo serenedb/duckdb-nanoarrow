@@ -450,7 +450,6 @@ void IPCFileStreamReader::ReadBodyPositionally(data_ptr_t body, idx_t body_start
     ReadData(body, body_size);
     return;
   }
-  // One positional read replaces the buffer-sized reads the buffered reader would issue
   ReadAt(*file_reader.handle, FileRead{body, body_size, body_start});
   file_reader.Seek(body_start + body_size);
 }
