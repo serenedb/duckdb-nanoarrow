@@ -9,6 +9,7 @@
 #pragma once
 
 #include "ipc/stream_factory.hpp"
+#include "ipc/stream_reader/ipc_file_stream_reader.hpp"
 
 #include "duckdb/common/multi_file/base_file_reader.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -60,14 +61,24 @@ class ArrowFileScan : public BaseFileReader {
   bool HasFooter() const;
 
  private:
+  struct SharedBatch {
+    mutex lock;
+    shared_ptr<ArrowArrayWrapper> batch;
+    idx_t taken = 0;
+  };
+
   //! A range of footer blocks that one scan reads
   struct BlockRange {
     idx_t begin;
     idx_t end;
+    idx_t part = 0;
+    idx_t parts = 1;
+    shared_ptr<SharedBatch> shared;
   };
 
   //! Groups the footer blocks into claims of at least this many body bytes
-  void PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks, idx_t min_claim_bytes);
+  void PlanClaims(IPCFileStreamReader& reader, idx_t min_claim_bytes, idx_t threads);
+  void ReadBatchPart(ArrowFileLocalState& lstate, ArrowArray& out);
   bool StreamClaims() const { return stream_claims && !file_row_number.IsValid(); }
   void InitializeScanData(ArrowFileLocalState& lstate,
                           shared_ptr<ArrowScanFactory> producer);
@@ -83,6 +94,7 @@ class ArrowFileScan : public BaseFileReader {
                     idx_t end, std::span<idx_t> survivors, DataChunk& chunk, idx_t found);
   //! Produces the stream of the blocks a local state claimed, from its block reader
   class BlockScanFactory;
+  class BatchPartStream;
 
   vector<string> names;
   vector<LogicalType> types;

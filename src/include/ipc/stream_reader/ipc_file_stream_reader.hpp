@@ -78,6 +78,7 @@ class IPCFileStreamReader final : public IPCStreamReader {
   void ShareDictionaries(shared_ptr<nanoarrow::ipc::UniqueDictionaries> shared) {
     dictionaries = std::move(shared);
   }
+  bool PlainRecordBatch(const ArrowIpcFileBlock& block);
   //! Reads only the record batches of these footer blocks, then reports the end
   void SetBlocks(const ArrowIpcFileBlock* begin, const ArrowIpcFileBlock* end);
   //! Reads the blocks left to scan into memory from any thread, whole bodies if asked

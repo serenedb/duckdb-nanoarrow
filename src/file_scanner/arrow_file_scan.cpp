@@ -38,6 +38,51 @@ void DeduplicateChildNames(ArrowSchema& schema) {
     DeduplicateChildNames(*schema.dictionary);
   }
 }
+
+std::pair<idx_t, idx_t> PartRows(idx_t length, idx_t part, idx_t parts) {
+  const auto rows = AlignValue<idx_t, STANDARD_VECTOR_SIZE>((length + parts - 1) / parts);
+  const auto begin = MinValue<idx_t>(rows * part, length);
+  return {begin, MinValue<idx_t>(begin + rows, length)};
+}
+
+struct BatchSlice {
+  shared_ptr<ArrowArrayWrapper> batch;
+  vector<ArrowArray> children;
+  vector<ArrowArray*> child_pointers;
+};
+
+void ReleaseSliceChild(ArrowArray* array) { array->release = nullptr; }
+
+void ReleaseSlice(ArrowArray* array) {
+  delete static_cast<BatchSlice*>(array->private_data);
+  array->release = nullptr;
+}
+
+void SliceBatch(shared_ptr<ArrowArrayWrapper> batch, idx_t begin, idx_t end,
+                ArrowArray& out) {
+  const auto& source = batch->arrow_array;
+  auto slice = make_uniq<BatchSlice>();
+  slice->children.resize(static_cast<idx_t>(source.n_children));
+  for (idx_t i = 0; i < slice->children.size(); i++) {
+    auto& child = slice->children[i];
+    child = *source.children[i];
+    child.offset += source.offset + static_cast<int64_t>(begin);
+    child.length = static_cast<int64_t>(end - begin);
+    if (child.null_count != 0) {
+      child.null_count = -1;
+    }
+    child.release = ReleaseSliceChild;
+    slice->child_pointers.push_back(&child);
+  }
+  out = source;
+  out.length = static_cast<int64_t>(end - begin);
+  out.offset = 0;
+  out.null_count = 0;
+  out.children = slice->child_pointers.data();
+  out.release = ReleaseSlice;
+  slice->batch = std::move(batch);
+  out.private_data = slice.release();
+}
 }  // namespace
 
 ArrowFileScan::ArrowFileScan(ClientContext& context, const OpenFileInfo& file)
@@ -66,8 +111,8 @@ ArrowFileScan::ArrowFileScan(ClientContext& context, const OpenFileInfo& file)
   count_without_bodies = reader.CanCountWithoutBodies();
   if (has_footer || reader.TryIndexStream()) {
     factory->mapping = reader.MapFile(context);
-    PlanClaims(reader.RecordBatchBlocks(),
-               reader.IsRemote() ? kRemoteMinClaimBodyBytes : kMinClaimBodyBytes);
+    PlanClaims(reader, reader.IsRemote() ? kRemoteMinClaimBodyBytes : kMinClaimBodyBytes,
+               TaskScheduler::QueryThreads(context));
     dictionary_blocks = reader.DictionaryBlocks();
     indexed_stream = !has_footer;
     const auto window = has_footer ? reader.FooterWindow() : reader.SchemaWindow();
@@ -95,12 +140,19 @@ void ArrowFileScan::LoadIndex(IPCFileStreamReader& reader) {
   }
 }
 
-void ArrowFileScan::PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks,
-                               idx_t min_claim_bytes) {
+void ArrowFileScan::PlanClaims(IPCFileStreamReader& reader, idx_t min_claim_bytes,
+                               idx_t threads) {
+  const auto& file_blocks = reader.RecordBatchBlocks();
   idx_t begin = 0;
   idx_t body_bytes = 0;
   for (idx_t i = 0; i < file_blocks.size(); i++) {
-    body_bytes += static_cast<idx_t>(file_blocks[i].body_length);
+    const auto block_bytes = static_cast<idx_t>(file_blocks[i].body_length);
+    if (block_bytes >= 2 * min_claim_bytes && begin < i) {
+      claims.push_back(BlockRange{begin, i});
+      begin = i;
+      body_bytes = 0;
+    }
+    body_bytes += block_bytes;
     if (body_bytes >= min_claim_bytes) {
       claims.push_back(BlockRange{begin, i + 1});
       begin = i + 1;
@@ -112,6 +164,63 @@ void ArrowFileScan::PlanClaims(const vector<ArrowIpcFileBlock>& file_blocks,
   }
   // Even one claim reads its blocks with few large reads instead of following the stream
   blocks = file_blocks;
+  if (!factory->mapping || claims.empty() || claims.size() >= threads) {
+    return;
+  }
+  const auto parts_per_claim = threads / claims.size();
+  vector<BlockRange> split;
+  for (auto& claim : claims) {
+    const auto parts = MinValue<idx_t>(
+        parts_per_claim,
+        static_cast<idx_t>(blocks[claim.begin].body_length) / min_claim_bytes);
+    if (claim.end != claim.begin + 1 || parts < 2 ||
+        !reader.PlainRecordBatch(blocks[claim.begin])) {
+      split.push_back(std::move(claim));
+      continue;
+    }
+    auto shared = make_shared_ptr<SharedBatch>();
+    for (idx_t part = 0; part < parts; part++) {
+      split.push_back(BlockRange{claim.begin, claim.end, part, parts, shared});
+    }
+  }
+  claims = std::move(split);
+}
+
+void ArrowFileScan::ReadBatchPart(ArrowFileLocalState& lstate, ArrowArray& out) {
+  const auto& claim = claims[lstate.claim_index];
+  auto& shared = *claim.shared;
+  shared_ptr<ArrowArrayWrapper> batch;
+  {
+    lock_guard<mutex> guard(shared.lock);
+    if (!shared.batch) {
+      auto decoded = make_shared_ptr<ArrowArrayWrapper>();
+      if (!lstate.block_reader->GetNextBatch(&decoded->arrow_array)) {
+        throw IOException(
+            "Arrow IPC file \"%s\" ended before a record batch its footer names",
+            GetFileName());
+      }
+      shared.batch = std::move(decoded);
+    }
+    batch = shared.batch;
+    if (++shared.taken == claim.parts) {
+      shared.batch.reset();
+    }
+  }
+  const auto rows =
+      PartRows(static_cast<idx_t>(batch->arrow_array.length), claim.part, claim.parts);
+  nanoarrow::UniqueArray slice;
+  SliceBatch(std::move(batch), rows.first, rows.second, *slice.get());
+  nanoarrow::UniqueArrayView view;
+  ArrowError error{};
+  THROW_NOT_OK(IOException, &error,
+               ArrowArrayViewInitFromSchema(
+                   view.get(), lstate.block_reader->GetOutputSchema(), &error));
+  THROW_NOT_OK(IOException, &error,
+               ArrowArrayViewSetArray(view.get(), slice.get(), &error));
+  THROW_NOT_OK(
+      IOException, &error,
+      ArrowArrayViewValidate(view.get(), NANOARROW_VALIDATION_LEVEL_FULL, &error));
+  ArrowArrayMove(slice.get(), &out);
 }
 
 idx_t ArrowFileScan::ClaimCount() const {
@@ -158,6 +267,32 @@ bool ArrowFileScan::TryInitializeScan(ClientContext& context,
   return true;
 }
 
+class ArrowFileScan::BatchPartStream {
+ public:
+  BatchPartStream(ArrowFileScan& scan, ArrowFileLocalState& lstate)
+      : scan(scan), lstate(lstate), stream(*lstate.block_reader) {}
+
+  int GetSchema(ArrowSchema* schema) { return stream.GetSchema(schema); }
+
+  int GetNext(ArrowArray* array) {
+    return stream.Wrap([&]() {
+      array->release = nullptr;
+      if (!done) {
+        done = true;
+        scan.ReadBatchPart(lstate, *array);
+      }
+    });
+  }
+
+  const char* GetLastError() const { return stream.GetLastError(); }
+
+ private:
+  ArrowFileScan& scan;
+  ArrowFileLocalState& lstate;
+  IpcArrayStream stream;
+  bool done = false;
+};
+
 //! The scan factory of the blocks a local state claimed. The state owns the scan data
 //! that holds this factory, so the state outlives it
 class ArrowFileScan::BlockScanFactory : public ArrowScanFactory {
@@ -172,7 +307,12 @@ class ArrowFileScan::BlockScanFactory : public ArrowScanFactory {
   unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters&) override {
     // PrepareScan already gave the reader the projection these parameters carry
     auto out = make_uniq<ArrowArrayStreamWrapper>();
-    IpcArrayStream(*lstate.block_reader).ToArrayStream(&out->arrow_array_stream);
+    if (scan.claims[lstate.claim_index].shared) {
+      nanoarrow::ArrayStreamFactory<BatchPartStream>::InitArrayStream(
+          new BatchPartStream(scan, lstate), &out->arrow_array_stream);
+    } else {
+      IpcArrayStream(*lstate.block_reader).ToArrayStream(&out->arrow_array_stream);
+    }
     return out;
   }
 
@@ -256,8 +396,14 @@ void ArrowFileScan::StartScan(ClientContext& context, ArrowFileLocalState& lstat
   lstate.local_arrow_global_state =
       ArrowTableFunction::ArrowScanInitGlobal(context, *lstate.init_input);
   if (file_row_number.IsValid() && !claims.empty()) {
-    lstate.local_arrow_global_state->Cast<ArrowScanGlobalState>().next_row_number =
-        BatchStarts()[claims[lstate.claim_index].begin];
+    const auto& claim = claims[lstate.claim_index];
+    const auto& starts = BatchStarts();
+    auto row = starts[claim.begin];
+    if (claim.shared) {
+      row += PartRows(starts[claim.end] - starts[claim.begin], claim.part, claim.parts)
+                 .first;
+    }
+    lstate.local_arrow_global_state->Cast<ArrowScanGlobalState>().next_row_number = row;
   }
   lstate.local_arrow_local_state = ArrowTableFunction::ArrowScanInitLocalInternal(
       context, *lstate.init_input, lstate.local_arrow_global_state.get());
@@ -307,7 +453,10 @@ void ArrowFileScan::PrepareScan(ClientContext& context,
     OpenBlockReader(lstate, !count_only);
   }
   const auto& claim = claims[lstate.claim_index];
-  lstate.block_reader->SetBlocks(blocks.data() + claim.begin, blocks.data() + claim.end);
+  const auto end = count_only && claim.part != 0 ? claim.begin : claim.end;
+  lstate.block_reader->SetBlocks(blocks.data() + claim.begin, blocks.data() + end);
+  lstate.block_reader->SetValidation(claim.shared ? NANOARROW_VALIDATION_LEVEL_DEFAULT
+                                                  : NANOARROW_VALIDATION_LEVEL_FULL);
   if (count_only) {
     lstate.block_reader->CountOnly();
     lstate.count_reader = lstate.block_reader.get();
@@ -319,7 +468,7 @@ AsyncResult ArrowFileScan::ScheduleIO(ClientContext& context,
                                       LocalTableFunctionState& lstate_p) {
   auto& lstate = lstate_p.Cast<ArrowFileLocalState>();
   // Without a footer the reads follow the stream, so they cannot be planned ahead
-  if (claims.empty()) {
+  if (claims.empty() || claims[lstate.claim_index].shared) {
     return SourceResultType::HAVE_MORE_OUTPUT;
   }
   auto& reader = *lstate.block_reader;

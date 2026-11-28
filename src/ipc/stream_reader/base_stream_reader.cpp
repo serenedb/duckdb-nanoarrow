@@ -113,19 +113,17 @@ bool IPCStreamReader::GetNextBatch(ArrowArray* out) {
 
     if (thread_safe_shared) {
       for (int64_t i = 0; i < array->n_children; i++) {
-        THROW_NOT_OK(
-            IOException, &error,
-            ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
-                decoder.get(), shared.get(), projected_fields[i], dictionaries->get(),
-                array->children[i], NANOARROW_VALIDATION_LEVEL_FULL, &error));
+        THROW_NOT_OK(IOException, &error,
+                     ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
+                         decoder.get(), shared.get(), projected_fields[i],
+                         dictionaries->get(), array->children[i], validation, &error));
       }
     } else {
       for (int64_t i = 0; i < array->n_children; i++) {
-        THROW_NOT_OK(
-            IOException, &error,
-            ArrowIpcDecoderDecodeArrayWithDictionaries(
-                decoder.get(), body_view, projected_fields[i], dictionaries->get(),
-                array->children[i], NANOARROW_VALIDATION_LEVEL_FULL, &error));
+        THROW_NOT_OK(IOException, &error,
+                     ArrowIpcDecoderDecodeArrayWithDictionaries(
+                         decoder.get(), body_view, projected_fields[i],
+                         dictionaries->get(), array->children[i], validation, &error));
       }
     }
 
@@ -136,12 +134,12 @@ bool IPCStreamReader::GetNextBatch(ArrowArray* out) {
     THROW_NOT_OK(IOException, &error,
                  ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
                      decoder.get(), shared.get(), -1, dictionaries->get(), array.get(),
-                     NANOARROW_VALIDATION_LEVEL_FULL, &error));
+                     validation, &error));
   } else {
     THROW_NOT_OK(IOException, &error,
                  ArrowIpcDecoderDecodeArrayWithDictionaries(
                      decoder.get(), body_view, -1, dictionaries->get(), array.get(),
-                     NANOARROW_VALIDATION_LEVEL_FULL, &error));
+                     validation, &error));
   }
 
   ArrowArrayMove(array.get(), out);

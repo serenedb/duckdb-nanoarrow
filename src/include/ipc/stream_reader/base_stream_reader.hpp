@@ -38,6 +38,7 @@ class IPCStreamReader {
   const ArrowSchema* GetOutputSchema();
   //! Gets the next batch
   bool GetNextBatch(ArrowArray* out);
+  void SetValidation(ArrowValidationLevel level) { validation = level; }
   //! Gets the unique buffer to get the next batch
   virtual nanoarrow::UniqueBuffer GetUniqueBuffer() {
     throw InternalException("IPCStreamReader::GetUniqueBuffer not implemented");
@@ -92,6 +93,7 @@ class IPCStreamReader {
   //! Keeps unaligned input headers alive in aligned storage for the decoder
   AllocatedData aligned_header;
   ArrowError error{};
+  ArrowValidationLevel validation = NANOARROW_VALIDATION_LEVEL_FULL;
   nanoarrow::ipc::UniqueDecoder decoder{};
   //! The dictionaries of the stream, which the claim readers of one file share
   shared_ptr<nanoarrow::ipc::UniqueDictionaries> dictionaries =

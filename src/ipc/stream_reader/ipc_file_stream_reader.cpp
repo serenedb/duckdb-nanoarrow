@@ -162,8 +162,9 @@ shared_ptr<MemoryMappedFile> IPCFileStreamReader::MapFile(ClientContext& context
     return nullptr;
   }
   auto& handle = *file_reader.handle;
-  return shared_ptr<MemoryMappedFile>(MapForReading(
+  mapping = shared_ptr<MemoryMappedFile>(MapForReading(
       context, handle.GetPath(), handle.OnDiskFile(), file_reader.FileSize(), 0));
+  return mapping;
 }
 
 bool IPCFileStreamReader::TryReadFooter() {
@@ -890,6 +891,16 @@ void IPCFileStreamReader::LoadDictionaries(const vector<ArrowIpcFileBlock>& bloc
     throw IOException("Arrow IPC footer names a record batch as a dictionary block");
   }
   reading_dictionaries = false;
+}
+
+bool IPCFileStreamReader::PlainRecordBatch(const ArrowIpcFileBlock& block) {
+  const auto offset = static_cast<idx_t>(block.offset);
+  const auto size = static_cast<idx_t>(block.metadata_length);
+  ReadInPlace(offset, size);
+  return DecodeBlockHeader(block,
+                           FetchedBlock{nullptr, mapping->GetData(offset, size)}) &&
+         decoder->message_type == NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH &&
+         decoder->codec == NANOARROW_IPC_COMPRESSION_TYPE_NONE && !NeedsEndianSwap();
 }
 
 void IPCFileStreamReader::SetBlocks(const ArrowIpcFileBlock* begin,
