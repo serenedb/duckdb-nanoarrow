@@ -27,10 +27,22 @@ SELECT count(*) FROM arrow_kv_metadata('data/arrow_js.arrow');
 ----
 0
 
-statement error
+# Polars writes views and puts the schema only in the footer, as Arrow JS does
+query II
 SELECT * FROM read_arrow('data/polars_views.arrow');
 ----
-The Arrow IPC file's footer cannot be read: Utf8View not yet supported in IPC reader
+a	x
+bb	y
+
+query I
+SELECT count(*) FROM read_arrow('data/polars_views.arrow');
+----
+2
+
+statement error
+SELECT * FROM read_arrow('data/views/list_view.arrow');
+----
+The Arrow IPC file's footer cannot be read: ListView/LargeListView not yet supported in IPC reader
 
 # The schema message of this file names the columns the other way round
 query II

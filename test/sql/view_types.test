@@ -1,0 +1,54 @@
+# name: test/sql/view_types.test
+# description: read_arrow reads string_view and binary_view columns, whose strings live in variadic buffers
+# group: [sql]
+
+require nanoarrow
+
+# pyarrow: three batches, inline strings only in the first, two data buffers for s in the second
+foreach file data/views/views.arrow data/views/views_zstd.arrows
+
+query IIIIIIII
+SELECT count(*), count(s), sum(length(s)), md5(string_agg(s, ',' ORDER BY id)), max(s), count(b), sum(octet_length(b)), sum(n)
+FROM read_arrow('${file}');
+----
+1106	948	37796	0f55524c5426260aa290b989f39249ec	string-001105-xxxxxxxxxxxxxxxxxxxxxxxxx	1005	4942	1833195
+
+query II
+SELECT count(l), sum(len(l)) FROM read_arrow('${file}');
+----
+1021	2041
+
+query III
+SELECT count(e), count(*) FILTER (WHERE e LIKE 'element-%'), sum(length(e)) FILTER (WHERE e LIKE 'element-%')
+FROM (SELECT unnest(l) AS e FROM read_arrow('${file}'));
+----
+1035	14	266
+
+# A column after the views is found past their data buffers
+query II
+SELECT sum(n), count(*) FILTER (WHERE n != id * 3) FROM read_arrow('${file}');
+----
+1833195	0
+
+query III
+SELECT id, s, b FROM read_arrow('${file}') WHERE id IN (2, 880, 900, 904, 1001) ORDER BY id;
+----
+2	s2	b2
+880	string-000880-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx	binary-00000880-
+900	string-000900-	binary-00000900-
+904	string-000904-xxxx	b904
+1001	string-001001-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx	b1
+
+endloop
+
+# A projection of a body over 1 MB reads only its columns' buffers, the 22 data buffers of s too
+query III
+SELECT count(s), sum(length(s)), md5(string_agg(s, ',' ORDER BY id)) FROM read_arrow('data/views/views_ranges.arrow');
+----
+17778	719995	311b98495159edadd24322dbb4d26dd0
+
+# Polars writes string views by default
+query IIII
+SELECT count(*), count(s), sum(length(s)), md5(string_agg(s, ',' ORDER BY id)) FROM read_arrow('data/views/polars_long_views.arrow');
+----
+700	622	17017	c8de1b1040b67aa4af3f4387b63f3199

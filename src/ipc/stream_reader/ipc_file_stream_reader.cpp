@@ -38,6 +38,24 @@ struct CodecOverride {
 };
 
 //! Collects the body ranges of one decoded field, children only and never dictionaries
+bool CollectBufferRange(const_data_ptr_t data, int64_t size_bytes, const_data_ptr_t base,
+                        idx_t body_size, vector<BodyRange>& ranges) {
+  // An empty buffer carries no pointer to take an offset from
+  if (size_bytes <= 0 || data == nullptr) {
+    return true;
+  }
+  if (data < base) {
+    return false;
+  }
+  const auto begin = static_cast<idx_t>(data - base);
+  const auto size = static_cast<idx_t>(size_bytes);
+  if (begin > body_size || size > body_size - begin) {
+    return false;
+  }
+  ranges.push_back(BodyRange{begin, begin + size});
+  return true;
+}
+
 bool CollectFieldRanges(const ArrowArrayView& view, const_data_ptr_t base,
                         idx_t body_size, vector<BodyRange>& ranges) {
   for (int i = 0; i < NANOARROW_MAX_FIXED_BUFFERS; i++) {
@@ -45,19 +63,16 @@ bool CollectFieldRanges(const ArrowArrayView& view, const_data_ptr_t base,
       break;
     }
     const auto& buffer = view.buffer_views[i];
-    // An empty buffer carries no pointer to take an offset from
-    if (buffer.size_bytes <= 0 || buffer.data.data == nullptr) {
-      continue;
-    }
-    if (buffer.data.as_uint8 < base) {
+    if (!CollectBufferRange(buffer.data.as_uint8, buffer.size_bytes, base, body_size,
+                            ranges)) {
       return false;
     }
-    const auto begin = static_cast<idx_t>(buffer.data.as_uint8 - base);
-    const auto size = static_cast<idx_t>(buffer.size_bytes);
-    if (begin > body_size || size > body_size - begin) {
+  }
+  for (int32_t i = 0; i < view.n_variadic_buffers; i++) {
+    if (!CollectBufferRange(static_cast<const_data_ptr_t>(view.variadic_buffers[i]),
+                            view.variadic_buffer_sizes[i], base, body_size, ranges)) {
       return false;
     }
-    ranges.push_back(BodyRange{begin, begin + size});
   }
   // A dictionary is decoded from its own batch body, so its buffers are not in ours
   for (int64_t i = 0; i < view.n_children; i++) {
