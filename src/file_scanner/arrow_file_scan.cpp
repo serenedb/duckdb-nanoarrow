@@ -356,7 +356,6 @@ void ArrowFileScan::InitializeScanData(ArrowFileLocalState& lstate,
 }
 
 void ArrowFileScan::OpenBlockReader(ArrowFileLocalState& lstate, bool read_columns) {
-  // The previous scan borrows the previous reader, so it goes first
   lstate.table_function_input.reset();
   lstate.local_arrow_local_state.reset();
   lstate.local_arrow_global_state.reset();
@@ -364,7 +363,6 @@ void ArrowFileScan::OpenBlockReader(ArrowFileLocalState& lstate, bool read_colum
   lstate.block_reader = factory->OpenReader();
   LoadIndex(*lstate.block_reader);
   InitializeScanData(lstate, make_shared_ptr<BlockScanFactory>(*this, lstate));
-  // The fetch needs the projection before the scan that would push it starts
   if (read_columns) {
     vector<idx_t> projection;
     for (const auto column_id : lstate.init_input->column_ids) {
@@ -375,14 +373,12 @@ void ArrowFileScan::OpenBlockReader(ArrowFileLocalState& lstate, bool read_colum
     if (!projection.empty()) {
       lstate.block_reader->SetColumnProjection(projection);
     }
-    // Claim readers share one set, since a file cannot replace its dictionaries
     if (lstate.block_reader->NeedsDictionaries()) {
       lock_guard<mutex> guard(dictionary_lock);
       if (dictionaries) {
         lstate.block_reader->ShareDictionaries(dictionaries);
       } else {
         lstate.block_reader->LoadDictionaries(dictionary_blocks);
-        // Shared buffers count their readers atomically only when nanoarrow has atomics
         if (ArrowSharedBufferIsThreadSafe()) {
           dictionaries = lstate.block_reader->Dictionaries();
         }
