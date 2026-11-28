@@ -307,7 +307,7 @@ class ArrowFileScan::BlockScanFactory : public ArrowScanFactory {
   unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters&) override {
     // PrepareScan already gave the reader the projection these parameters carry
     auto out = make_uniq<ArrowArrayStreamWrapper>();
-    if (scan.claims[lstate.claim_index].shared) {
+    if (!scan.claims.empty() && scan.claims[lstate.claim_index].shared) {
       nanoarrow::ArrayStreamFactory<BatchPartStream>::InitArrayStream(
           new BatchPartStream(scan, lstate), &out->arrow_array_stream);
     } else {
