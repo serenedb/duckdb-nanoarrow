@@ -798,8 +798,7 @@ void IPCFileStreamReader::ReadAll(const vector<FileRead>& reads) {
 }
 
 void IPCFileStreamReader::ReadInPlace(idx_t location, idx_t size) {
-  mapping->PrefetchMissing(location, size);
-  file_reader.handle->ReadInPlace(QueryContext(), size, location);
+  mapping->ReadInPlace(*file_reader.handle, QueryContext(), location, size);
 }
 
 shared_ptr<void> IPCFileStreamReader::MappedOwner(idx_t begin, idx_t end) const {
