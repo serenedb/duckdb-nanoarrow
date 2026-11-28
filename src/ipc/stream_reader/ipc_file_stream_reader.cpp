@@ -40,7 +40,6 @@ struct CodecOverride {
 //! Collects the body ranges of one decoded field, children only and never dictionaries
 bool CollectBufferRange(const_data_ptr_t data, int64_t size_bytes, const_data_ptr_t base,
                         idx_t body_size, vector<BodyRange>& ranges) {
-  // An empty buffer carries no pointer to take an offset from
   if (size_bytes <= 0 || data == nullptr) {
     return true;
   }
