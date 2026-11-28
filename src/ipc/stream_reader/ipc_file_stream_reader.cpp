@@ -629,7 +629,6 @@ void IPCFileStreamReader::CountOnly() {
     throw InternalException("NextBatchLength needs a field without dictionaries");
   }
   if (!skip_bodies) {
-    // The view of a compressed body is only validated, so its sizes are all it needs
     SetArrowIpcDecoderSizesOnly(*decoder.get());
     skip_bodies = true;
   }
@@ -866,7 +865,6 @@ ArrowIpcMessageType IPCFileStreamReader::DecodeFetchedBlock(
       const auto body_start =
           static_cast<idx_t>(block.offset) + static_cast<idx_t>(block.metadata_length);
       if (mapping) {
-        // Counting reads only the recorded lengths of a compressed body's buffers
         if (NeedsEndianSwap()) {
           ReadInPlace(body_start, body_size);
         }

@@ -34,8 +34,6 @@ struct ArrowIpcCompressionOptions {
 //! Creates an IPC decoder, nanoarrow decompresses zstd and lz4 bodies itself
 nanoarrow::ipc::UniqueDecoder NewDuckDBArrowDecoder();
 
-//! Makes the decoder size compressed buffers from their recorded lengths and leave
-//! them undecoded, for views that are only validated against a batch's length
 void SetArrowIpcDecoderSizesOnly(ArrowIpcDecoder& decoder);
 
 //! Makes an IPC encoder compress bodies, throws if this nanoarrow build lacks the codec
