@@ -26,7 +26,7 @@ endloop
 statement error
 SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/bad_body_zstd.arrows');
 ----
-Failed to decompress an Arrow IPC buffer with zstd
+<REGEX>:.*get_next failed\(\): IOException: [^{].*Failed to decompress an Arrow IPC buffer with zstd.*
 
 statement error
 SELECT sum(i) FROM read_arrow('__WORKING_DIRECTORY__/data/corrupt/bad_body_lz4.arrows');
